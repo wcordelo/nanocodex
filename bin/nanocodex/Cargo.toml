@@ -9,23 +9,88 @@ license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 description = "Daily-driver TUI and headless JSONL adapter for Nanocodex"
+build = "build.rs"
+
+[package.metadata.cargo-machete]
+# cargo-machete does not resolve imports from the package build script.
+ignored = ["chrono", "vergen"]
+
+[features]
+default = []
+# Keep paid-provider composition out of the direct-agent development graph.
+tempo = [
+    "dep:alloy-primitives",
+    "dep:http-body-util",
+    "dep:hudsucker",
+    "dep:mpp",
+    "dep:nanousd",
+    "dep:nix",
+    "dep:rand",
+    "dep:tempo-alloy",
+]
 
 [dependencies]
+arboard.workspace = true
+async-trait.workspace = true
+alloy-primitives = { workspace = true, optional = true }
+base64.workspace = true
 clap.workspace = true
 crossterm.workspace = true
 dotenvy.workspace = true
 eyre.workspace = true
+fs2.workspace = true
 futures-util.workspace = true
+hex.workspace = true
+http-body-util = { workspace = true, optional = true }
+hudsucker = { workspace = true, optional = true }
+image.workspace = true
 nanocodex.workspace = true
+nanocodex-browser.workspace = true
 nanocodex-observability.workspace = true
+nanocodex-voice.workspace = true
+nix = { workspace = true, optional = true }
+nanousd = { workspace = true, optional = true }
+pulldown-cmark.workspace = true
+mpp = { workspace = true, optional = true, features = ["client", "tempo", "reqwest-rustls-tls"] }
+rand = { workspace = true, optional = true }
 ratatui.workspace = true
+ratatex.workspace = true
+reqwest = { workspace = true, features = ["blocking", "stream"] }
+self-replace.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+syntect.workspace = true
+two-face.workspace = true
+sha2.workspace = true
+shlex.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tempo-alloy = { workspace = true, optional = true }
+tracing.workspace = true
+unicode-segmentation.workspace = true
 unicode-width.workspace = true
 
+[target.'cfg(any(all(target_os = "linux", not(target_env = "musl")), all(target_os = "macos", target_arch = "aarch64")))'.dependencies]
+nanocodex-vm.workspace = true
+
+[build-dependencies]
+chrono.workspace = true
+vergen = { workspace = true, features = ["build", "git", "gitcl"] }
+
 [dev-dependencies]
+axum.workspace = true
+criterion.workspace = true
+nanocodex-tools.workspace = true
+reqwest = { workspace = true, features = ["query"] }
 tokio-tungstenite.workspace = true
+tracing-subscriber.workspace = true
+
+[[bench]]
+name = "tui_render"
+harness = false
 
 [[bin]]
 name = "nanocodex"

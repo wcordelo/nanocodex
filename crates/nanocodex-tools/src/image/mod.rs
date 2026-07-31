@@ -1,3 +1,5 @@
+//! Prompt image preparation and model-output image normalization.
+
 use std::{
     collections::{HashMap, VecDeque},
     io::Cursor,
@@ -12,7 +14,8 @@ use image::{
     codecs::{jpeg::JpegEncoder, png::PngEncoder, webp::WebPEncoder},
     imageops::FilterType,
 };
-use nanocodex_core::{ContentItem, ImageDetail, PromptInput, UserInput};
+pub use nanocodex_oai_api::ImageDetail;
+use nanocodex_oai_api::{PromptInput, UserInput, responses::ContentItem};
 use sha1::{Digest as _, Sha1};
 
 use super::{ToolOutputBody, ToolOutputContent};
@@ -150,6 +153,10 @@ impl ImagePreparationError {
     }
 }
 
+/// Validates, normalizes, and bounds images returned by a tool.
+///
+/// Unsupported or failed images become model-visible text placeholders. CPU
+/// image work runs on the blocking pool.
 pub async fn prepare_output_images(output: &mut ToolOutputBody) {
     let ToolOutputBody::Content(content) = output else {
         return;
@@ -177,6 +184,10 @@ pub async fn prepare_output_images(output: &mut ToolOutputBody) {
     }
 }
 
+/// Converts public prompt input into provider-ready typed content.
+///
+/// Local or data-URL images are validated and resized according to their detail
+/// policy. Audio input is retained as an explicit placeholder until supported.
 pub async fn prepare_user_input(input: &PromptInput) -> Vec<ContentItem> {
     let input = match input {
         PromptInput::Text(text) => vec![UserInput::Text { text: text.clone() }],
@@ -687,6 +698,25 @@ mod tests {
         let ppm = b"P6\n1 1\n255\n\xff\x00\x00".to_vec();
         let image = load_for_prompt_bytes(Path::new("screen.ppm"), ppm, HIGH_DETAIL_LIMITS)
             .expect("decode portable pixmap");
+        assert_eq!(image.mime, "image/png");
+        assert!(image.bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    #[test]
+    fn converts_bitmap_to_supported_png() {
+        let image = RgbaImage::from_pixel(1, 1, Rgba([10, 20, 30, 255]));
+        let mut encoded = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut encoded, ImageFormat::Bmp)
+            .expect("encode bitmap fixture");
+
+        let image = load_for_prompt_bytes(
+            Path::new("tool-output.bmp"),
+            encoded.into_inner(),
+            HIGH_DETAIL_LIMITS,
+        )
+        .expect("decode bitmap");
+
         assert_eq!(image.mime, "image/png");
         assert!(image.bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
     }

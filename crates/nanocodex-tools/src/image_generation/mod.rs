@@ -4,16 +4,18 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use nanocodex_core::{
-    ContentItem, FunctionOutputBody, FunctionOutputContent, ResponseItem, ToolDefinition,
+use nanocodex_oai_api::{
+    auth::{OpenAiAuth, OpenAiAuthMode, OpenAiAuthSnapshot},
+    responses::{ContentItem, FunctionOutputBody, FunctionOutputContent, ResponseItem},
+    tools::ToolDefinition,
 };
-use reqwest::header::USER_AGENT;
+use reqwest::header::{AUTHORIZATION, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
-    ImageDetail, ImageGenerationConfig, Tool, ToolContext, ToolExecution, ToolInput,
-    ToolOutputBody, ToolOutputContent, image::load_for_prompt_data_url,
+    ImageDetail, ImageGenerationConfig, Tool, ToolContext, ToolInput, ToolOutput,
+    ToolOutputContent, ToolResult, image::load_for_prompt_data_url,
 };
 
 const DESCRIPTION: &str = include_str!("imagegen_description.md");
@@ -26,34 +28,39 @@ pub(super) struct ImageGenerationHandler {
     client: reqwest::Client,
     generation_endpoint: String,
     edit_endpoint: String,
-    api_key: String,
+    auth: OpenAiAuth,
     save_root: PathBuf,
 }
 
 impl ImageGenerationHandler {
+    #[cfg(test)]
     pub(super) fn new(config: ImageGenerationConfig) -> Self {
+        Self::with_client(config, reqwest::Client::new())
+    }
+
+    pub(super) fn with_client(config: ImageGenerationConfig, client: reqwest::Client) -> Self {
         let api_base_url = config.api_base_url.trim_end_matches('/');
         Self {
-            client: reqwest::Client::new(),
+            client,
             generation_endpoint: format!("{api_base_url}/images/generations"),
             edit_endpoint: format!("{api_base_url}/images/edits"),
-            api_key: config.api_key,
+            auth: config.auth,
             save_root: config.save_root,
         }
     }
 
-    async fn run(&self, input: &str, context: ToolContext<'_>) -> ToolExecution {
+    async fn run(&self, input: &str, context: ToolContext<'_>) -> ToolOutput {
         let args = match serde_json::from_str::<ImagegenArgs>(input) {
             Ok(args) => args,
             Err(error) => {
-                return ToolExecution::error(format!(
+                return ToolOutput::error(format!(
                     "failed to parse image_gen.imagegen arguments: {error}"
                 ));
             }
         };
-        let request = match request_for_args(&args, context.history).await {
+        let request = match request_for_args(&args, context.history()).await {
             Ok(request) => request,
-            Err(error) => return ToolExecution::error(error),
+            Err(error) => return ToolOutput::error(error),
         };
         let response = match request {
             ImageRequest::Generate(request) => {
@@ -69,15 +76,15 @@ impl ImageGenerationHandler {
             Ok(response) => match response.data.into_iter().next() {
                 Some(data) => data.b64_json,
                 None => {
-                    return ToolExecution::error("image generation returned no image data");
+                    return ToolOutput::error("image generation returned no image data");
                 }
             },
-            Err(error) => return ToolExecution::error(format!("image generation failed: {error}")),
+            Err(error) => return ToolOutput::error(format!("image generation failed: {error}")),
         };
         let saved_path = match save_result(
             &self.save_root,
-            context.session_id,
-            context.call_id,
+            context.session_id(),
+            context.call_id(),
             &result,
         )
         .await
@@ -101,12 +108,7 @@ impl ImageGenerationHandler {
             });
             code_mode_value["output_hint"] = Value::String(output_hint);
         }
-        ToolExecution {
-            output: ToolOutputBody::Content(output_items),
-            success: true,
-            code_mode_value: Some(code_mode_value),
-            metadata: None,
-        }
+        ToolOutput::content(output_items).with_code_mode_value(code_mode_value)
     }
 
     async fn post_image_request<R: Serialize + ?Sized>(
@@ -115,15 +117,28 @@ impl ImageGenerationHandler {
         request: &R,
         operation: &str,
     ) -> Result<ImageResponse, String> {
-        let response = self
-            .client
-            .post(endpoint)
-            .header(USER_AGENT, concat!("nanocodex/", env!("CARGO_PKG_VERSION")))
-            .bearer_auth(&self.api_key)
-            .json(request)
-            .send()
+        let auth = self
+            .auth
+            .snapshot()
             .await
-            .map_err(|error| format!("{operation} request failed: {error}"))?;
+            .map_err(|error| error.to_string())?;
+        let response = self.send_authorized(endpoint, request, &auth).await?;
+        let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            && auth.mode() == OpenAiAuthMode::ChatGpt
+        {
+            self.auth
+                .recover_unauthorized(&auth)
+                .await
+                .map_err(|error| error.to_string())?;
+            let refreshed = self
+                .auth
+                .snapshot()
+                .await
+                .map_err(|error| error.to_string())?;
+            self.send_authorized(endpoint, request, &refreshed).await?
+        } else {
+            response
+        };
         let status = response.status();
         let body = response
             .bytes()
@@ -138,17 +153,37 @@ impl ImageGenerationHandler {
         serde_json::from_slice(&body)
             .map_err(|error| format!("failed to decode {operation} response: {error}"))
     }
+
+    async fn send_authorized<R: Serialize + ?Sized>(
+        &self,
+        endpoint: &str,
+        body: &R,
+        auth: &OpenAiAuthSnapshot,
+    ) -> Result<reqwest::Response, String> {
+        let mut request = self
+            .client
+            .post(endpoint)
+            .header(USER_AGENT, concat!("nanocodex/", env!("CARGO_PKG_VERSION")))
+            .header(AUTHORIZATION, format!("Bearer {}", auth.bearer()));
+        if let Some(account_id) = auth.account_id() {
+            request = request.header("ChatGPT-Account-ID", account_id);
+        }
+        if auth.is_fedramp() {
+            request = request.header("X-OpenAI-Fedramp", "true");
+        }
+        request
+            .json(body)
+            .send()
+            .await
+            .map_err(|error| format!("image request failed: {error}"))
+    }
 }
 
 #[async_trait::async_trait]
 impl Tool for ImageGenerationHandler {
-    fn name(&self) -> &'static str {
-        "image_gen__imagegen"
-    }
-
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::function(
-            self.name(),
+            "image_gen__imagegen",
             DESCRIPTION,
             json!({
                 "type": "object",
@@ -171,12 +206,9 @@ impl Tool for ImageGenerationHandler {
         )
     }
 
-    async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolExecution {
-        let input = match input.function_json() {
-            Ok(input) => input,
-            Err(error) => return ToolExecution::error(error.to_string()),
-        };
-        self.run(input.get(), context).await
+    async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
+        let input = input.function_json()?;
+        Ok(self.run(input.get(), context).await)
     }
 }
 
@@ -444,7 +476,7 @@ fn sanitize_path_component(value: &str) -> String {
 fn image_output_hint(path: &Path) -> Option<String> {
     let output_dir = path.parent()?;
     let hint = format!(
-        "Generated images are saved to {} as {} by default.\nIf you need to use a generated image at another path, copy it and leave the original in place unless the user explicitly asks you to delete it.",
+        "Generated images are saved to {} as {} by default.\nIf you need to use a generated image at another path, copy it and leave the original in place unless the user explicitly asks you to delete it.\nThe generated image is already displayed to the user. There is no need to render it in the final response as a Markdown image or file link.",
         output_dir.display(),
         path.display()
     );

@@ -2,7 +2,10 @@
 
 import {
   ArrowUpRight,
+  Check,
   ChevronRight,
+  Copy,
+  GitBranch,
   GitPullRequest,
   Moon,
   Search,
@@ -19,14 +22,23 @@ import {
   useState,
 } from "react";
 import type { CodeBrowserHandle } from "./CodeBrowser";
+import type { CommitCodeStreamHandle } from "./CommitCodeStream";
 import harborSummaryData from "./data/harbor-summary.json";
-import repositoryData from "./data/harness-repository.json";
 import type { EvalComparison } from "./Harbor";
 import { fuzzyScore } from "./fuzzy";
-import { PierreWorkerProvider } from "./PierreWorkerProvider";
 
 const Harbor = lazy(() =>
   import("./Harbor").then((module) => ({ default: module.Harbor }))
+);
+const AgentTerminal = lazy(() =>
+  import("./AgentTerminal").then((module) => ({
+    default: module.AgentTerminal,
+  }))
+);
+const PierreWorkerProvider = lazy(() =>
+  import("./PierreWorkerProvider").then((module) => ({
+    default: module.PierreWorkerProvider,
+  }))
 );
 const CodeBrowser = lazy(() =>
   import("./CodeBrowser").then((module) => ({ default: module.CodeBrowser }))
@@ -36,8 +48,14 @@ const CommitCodeStream = lazy(() =>
     default: module.CommitCodeStream,
   }))
 );
+const VirtualCommitList = lazy(() =>
+  import("./VirtualCommitList").then((module) => ({
+    default: module.VirtualCommitList,
+  })),
+);
 
 export type Theme = "light" | "dark";
+type Scope = "all" | "eval" | "fix" | "docs" | "perf";
 type ProposalState = "ready" | "submitting" | "payment-required";
 type Surface =
   | "home"
@@ -105,12 +123,36 @@ type RepositorySnapshot = {
   commits: HarnessCommit[];
 };
 
-const snapshot = repositoryData as RepositorySnapshot;
+const emptyCommits: HarnessCommit[] = [];
+let repositorySnapshotPromise: Promise<RepositorySnapshot> | undefined;
+
+function loadRepositorySnapshot(): Promise<RepositorySnapshot> {
+  repositorySnapshotPromise ??= import("./data/harness-repository.json").then(
+    (module) => module.default as RepositorySnapshot,
+  ).catch((error) => {
+    repositorySnapshotPromise = undefined;
+    throw error;
+  });
+  return repositorySnapshotPromise;
+}
+
 const evalComparison = (
   harborSummaryData as { comparison: EvalComparison | null }
 ).comparison;
-function commitSearchScore(commit: HarnessCommit, query: string) {
-  const tokens = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+const scopes: Array<{ id: Scope; label: string }> = [
+  { id: "all", label: "All commits" },
+  { id: "eval", label: "Eval" },
+  { id: "fix", label: "Fix" },
+  { id: "docs", label: "Docs" },
+  { id: "perf", label: "Perf" },
+];
+
+function subjectScope(subject: string) {
+  const prefix = subject.split(":", 1)[0].toLowerCase();
+  return scopes.some(({ id }) => id === prefix) ? (prefix as Scope) : "other";
+}
+
+function commitSearchScore(commit: HarnessCommit, tokens: readonly string[]) {
   if (!tokens.length) return 0;
   const fields = [
     { value: commit.hash, weight: 160 },
@@ -204,6 +246,19 @@ const homeEvalMetrics = evalComparison
     ]
   : [];
 
+const installCommand =
+  "curl -fsSL https://nanocodex.paradigm.xyz | bash";
+
+function RepositorySurfaceLoading({ failed }: { failed: boolean }) {
+  return (
+    <section className="requests-empty page-grid" aria-live="polite">
+      <GitBranch aria-hidden="true" />
+      <p className="eyebrow">Repository</p>
+      <h1>{failed ? "Repository data unavailable." : "Loading repository…"}</h1>
+    </section>
+  );
+}
+
 export function Xedoc() {
   const [theme, setTheme] = useState<Theme>(() => {
     const initialTheme = document.documentElement.dataset.theme;
@@ -226,33 +281,110 @@ export function Xedoc() {
     }
     return "home";
   });
+  const [snapshot, setSnapshot] = useState<RepositorySnapshot>();
+  const [repositoryLoadError, setRepositoryLoadError] = useState(false);
+  const [scope, setScope] = useState<Scope>("all");
   const [query, setQuery] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
-  const [selectedHash, setSelectedHash] = useState(snapshot.repository.head);
+  const [selectedHash, setSelectedHash] = useState<string>();
   const [proposalOpen, setProposalOpen] = useState(false);
   const [proposalState, setProposalState] = useState<ProposalState>("ready");
   const [proposalTitle, setProposalTitle] = useState("");
+  const [commitRailOpen, setCommitRailOpen] = useState(false);
+  const [installCopied, setInstallCopied] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const headerCenterRef = useRef<HTMLDivElement>(null);
   const codeBrowserRef = useRef<CodeBrowserHandle>(null);
+  const commitStreamRef = useRef<CommitCodeStreamHandle>(null);
 
-  const selected =
-    snapshot.commits.find((commit) => commit.hash === selectedHash) ??
-    snapshot.commits[0];
+  const commits = snapshot?.commits ?? emptyCommits;
+  const selected = useMemo(
+    () =>
+      commits.find((commit) => commit.hash === selectedHash) ??
+      commits[0] ??
+      null,
+    [commits, selectedHash],
+  );
+  const scopeCounts = useMemo(
+    () =>
+      commits.reduce<Record<Scope, number>>(
+        (counts, commit) => {
+          const commitScope = subjectScope(commit.subject);
+          if (commitScope !== "other") counts[commitScope] += 1;
+          return counts;
+        },
+        {
+          all: commits.length,
+          eval: 0,
+          fix: 0,
+          docs: 0,
+          perf: 0,
+        },
+      ),
+    [commits],
+  );
+  const queryTokens = useMemo(
+    () => query.trim().toLowerCase().split(/\s+/).filter(Boolean),
+    [query],
+  );
+
+  const filteredCommits = useMemo(() => {
+    const scoped = commits.filter(
+      (commit) => scope === "all" || subjectScope(commit.subject) === scope,
+    );
+    if (!queryTokens.length) return scoped;
+    return scoped
+      .map((commit) => ({
+        commit,
+        score: commitSearchScore(commit, queryTokens),
+      }))
+      .filter(
+        (match): match is { commit: HarnessCommit; score: number } =>
+          match.score !== null,
+      )
+      .sort((left, right) => right.score - left.score)
+      .map((match) => match.commit);
+  }, [commits, queryTokens, scope]);
 
   const searchResults = useMemo(
-    () =>
-      snapshot.commits
-        .map((commit) => ({ commit, score: commitSearchScore(commit, query) }))
+    () => {
+      if (!searchOpen) return [];
+      return commits
+        .map((commit) => ({
+          commit,
+          score: commitSearchScore(commit, queryTokens),
+        }))
         .filter(
           (match): match is { commit: HarnessCommit; score: number } =>
-            match.score !== null
+            match.score !== null,
         )
         .sort((left, right) => right.score - left.score)
         .slice(0, 12)
-        .map((match) => match.commit),
-    [query]
+        .map((match) => match.commit);
+    },
+    [commits, queryTokens, searchOpen],
   );
+
+  useEffect(() => {
+    const needsRepository =
+      surface === "code" || surface === "commits" || proposalOpen;
+    if (!needsRepository || snapshot) return;
+    let active = true;
+    setRepositoryLoadError(false);
+    void loadRepositorySnapshot().then(
+      (loaded) => {
+        if (!active) return;
+        setSnapshot(loaded);
+        setSelectedHash((current) => current ?? loaded.repository.head);
+      },
+      () => {
+        if (active) setRepositoryLoadError(true);
+      },
+    );
+    return () => {
+      active = false;
+    };
+  }, [proposalOpen, snapshot, surface]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -328,6 +460,7 @@ export function Xedoc() {
       if (event.key === "Escape") {
         setSearchOpen(false);
         setProposalOpen(false);
+        setCommitRailOpen(false);
         codeBrowserRef.current?.closeSearches();
         return;
       }
@@ -377,12 +510,18 @@ export function Xedoc() {
   }, [surface]);
 
   const selectCommit = (commit: HarnessCommit) => {
+    const index = commits.findIndex(
+      (candidate) => candidate.hash === commit.hash
+    );
     setSelectedHash(commit.hash);
     setSearchOpen(false);
+    setCommitRailOpen(false);
     setQuery("");
+    if (index >= 0) commitStreamRef.current?.scrollToCommit(index);
   };
 
   const submitProposal = async () => {
+    if (!snapshot || !selected) return;
     setProposalState("submitting");
     try {
       await fetch("/api/proposals", {
@@ -400,8 +539,7 @@ export function Xedoc() {
   };
 
   return (
-    <PierreWorkerProvider>
-      <div className={`site-shell surface-${surface}`}>
+    <div className={`site-shell surface-${surface}`}>
         <header className="site-header">
           <a
             className="wordmark"
@@ -491,6 +629,92 @@ export function Xedoc() {
                       entire product.
                     </p>
                   </header>
+
+                  <Suspense
+                    fallback={
+                      <section
+                        className="agent-tui agent-tui-loading"
+                        aria-label="Nanocodex terminal"
+                        aria-busy="true"
+                      >
+                        Loading agent…
+                      </section>
+                    }
+                  >
+                    <AgentTerminal />
+                  </Suspense>
+
+                  <section
+                    className="home-release-section"
+                    aria-labelledby="home-release-title"
+                  >
+                    <div className="home-release-heading">
+                      <div>
+                        <p className="eyebrow">Install the CLI</p>
+                        <h2 id="home-release-title">One binary. Kept current.</h2>
+                      </div>
+                      <a
+                        href="https://github.com/gakonst/nanocodex/releases/latest"
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        Latest release <ArrowUpRight aria-hidden="true" />
+                      </a>
+                    </div>
+                    <div className="home-install-command">
+                      <code>{installCommand}</code>
+                      <button
+                        type="button"
+                        aria-label="Copy install command"
+                        onClick={() => {
+                          void navigator.clipboard
+                            .writeText(installCommand)
+                            .then(() => {
+                              setInstallCopied(true);
+                              window.setTimeout(
+                                () => setInstallCopied(false),
+                                1_500
+                              );
+                            });
+                        }}
+                      >
+                        {installCopied ? (
+                          <Check aria-hidden="true" />
+                        ) : (
+                          <Copy aria-hidden="true" />
+                        )}
+                        {installCopied ? "Copied" : "Copy"}
+                      </button>
+                    </div>
+                    <div className="home-release-grid">
+                      <article>
+                        <span>Update</span>
+                        <code>nanocodex update</code>
+                        <p>
+                          Downloads the host binary, verifies its SHA-256, and
+                          replaces the current executable.
+                        </p>
+                      </article>
+                      <article>
+                        <span>Embed</span>
+                        <code>cargo add nanocodex</code>
+                        <p>
+                          All seven public Rust crates ship together under one
+                          version in dependency order.
+                        </p>
+                      </article>
+                      <article>
+                        <span>Inspect</span>
+                        <a href="https://github.com/gakonst/nanocodex/blob/master/CHANGELOG.md">
+                          Release changelog <ArrowUpRight aria-hidden="true" />
+                        </a>
+                        <p>
+                          Conventional commits are grouped in full; GitHub
+                          release notes credit every pull request contributor.
+                        </p>
+                      </article>
+                    </div>
+                  </section>
 
                   {evalComparison ? (
                     <section
@@ -614,30 +838,132 @@ export function Xedoc() {
 
                 </article>
             </section>
-          ) : surface === "code" ? (
+          ) : surface === "code" ? snapshot ? (
             <Suspense fallback={null}>
-              <CodeBrowser
-                ref={codeBrowserRef}
-                files={snapshot.tree}
-                treeInput={snapshot.treeInput}
-                branch={snapshot.repository.branch}
-                head={snapshot.repository.head}
-                theme={theme}
-              />
-            </Suspense>
-          ) : surface === "commits" ? (
-            <section
-              className="commits-workspace"
-              aria-label="Repository commits"
-            >
-              <Suspense fallback={null}>
-                <CommitCodeStream
-                  commits={snapshot.commits}
-                  patchUrl={snapshot.commitPatchUrl}
+              <PierreWorkerProvider>
+                <CodeBrowser
+                  ref={codeBrowserRef}
+                  files={snapshot.tree}
+                  treeInput={snapshot.treeInput}
+                  branch={snapshot.repository.branch}
+                  head={snapshot.repository.head}
                   theme={theme}
                 />
-              </Suspense>
-            </section>
+              </PierreWorkerProvider>
+            </Suspense>
+          ) : (
+            <RepositorySurfaceLoading failed={repositoryLoadError} />
+          ) : surface === "commits" ? snapshot ? (
+            <Suspense fallback={null}>
+              <PierreWorkerProvider>
+                <section
+                  className="commits-workspace"
+                  aria-label="Repository commits"
+                >
+                <button
+                  className={
+                    commitRailOpen
+                      ? "workspace-backdrop is-visible"
+                      : "workspace-backdrop"
+                  }
+                  type="button"
+                  aria-label="Close commit list"
+                  onClick={() => setCommitRailOpen(false)}
+                />
+                <aside
+                  className={
+                    commitRailOpen
+                      ? "commit-sidebar is-mobile-open"
+                      : "commit-sidebar"
+                  }
+                  aria-labelledby="history-title"
+                >
+                  <header className="commit-sidebar-header">
+                    <div>
+                      <strong id="history-title">Jump to commit</strong>
+                      <span>
+                        <GitBranch aria-hidden="true" />{" "}
+                        {snapshot.repository.branch} · {snapshot.commits.length}
+                      </span>
+                    </div>
+                    <nav
+                      className="commit-sidebar-actions"
+                      aria-label="Commit index actions"
+                    >
+                      <button
+                        className="icon-button"
+                        type="button"
+                        onClick={() => setSearchOpen(true)}
+                      >
+                        <Search aria-hidden="true" />
+                        <span className="sr-only">Find commits</span>
+                        <kbd>F</kbd>
+                      </button>
+                      <button
+                        className="mobile-drawer-close"
+                        type="button"
+                        onClick={() => setCommitRailOpen(false)}
+                        aria-label="Close commit index"
+                      >
+                        <X aria-hidden="true" />
+                      </button>
+                    </nav>
+                  </header>
+
+                  <nav
+                    className="commit-scope-tabs"
+                    aria-label="Quick jump scopes"
+                  >
+                    {scopes.map((item) => (
+                      <button
+                        className={scope === item.id ? "is-active" : ""}
+                        type="button"
+                        key={item.id}
+                        onClick={() => setScope(item.id)}
+                      >
+                      {item.label} <span>{scopeCounts[item.id]}</span>
+                      </button>
+                    ))}
+                  </nav>
+
+                  {query ? (
+                    <div className="commit-query">
+                      <span>
+                        {filteredCommits.length} matches for “{query}”
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setQuery("")}
+                        aria-label="Clear commit search"
+                      >
+                        <X aria-hidden="true" />
+                      </button>
+                    </div>
+                  ) : null}
+
+                  <Suspense fallback={<div className="commit-list" />}>
+                    <VirtualCommitList
+                      commits={filteredCommits}
+                      selectedHash={selected?.hash}
+                      onClearSearch={() => setQuery("")}
+                      onSelectCommit={selectCommit}
+                    />
+                  </Suspense>
+                </aside>
+                <Suspense fallback={null}>
+                  <CommitCodeStream
+                    ref={commitStreamRef}
+                    commits={commits}
+                    onOpenCommitRail={() => setCommitRailOpen(true)}
+                    patchUrl={snapshot.commitPatchUrl}
+                    theme={theme}
+                  />
+                </Suspense>
+                </section>
+              </PierreWorkerProvider>
+            </Suspense>
+          ) : (
+            <RepositorySurfaceLoading failed={repositoryLoadError} />
           ) : surface === "requests" ? (
             <section
               className="requests-empty page-grid"
@@ -738,7 +1064,13 @@ export function Xedoc() {
               </button>
               <p className="eyebrow">MPP proposal gate · testnet preview</p>
               <h2 id="proposal-title">Propose a change</h2>
-              {proposalState === "payment-required" ? (
+              {!snapshot || !selected ? (
+                <p className="proposal-intro">
+                  {repositoryLoadError
+                    ? "Repository data is unavailable."
+                    : "Loading repository…"}
+                </p>
+              ) : proposalState === "payment-required" ? (
                 <div className="payment-required">
                   <div className="payment-mark">402</div>
                   <h3>Payment challenge ready</h3>
@@ -800,7 +1132,6 @@ export function Xedoc() {
             </section>
           </div>
         ) : null}
-      </div>
-    </PierreWorkerProvider>
+    </div>
   );
 }

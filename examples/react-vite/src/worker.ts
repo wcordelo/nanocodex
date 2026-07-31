@@ -1,84 +1,98 @@
-import init, { Nanocodex } from "../../../bindings/wasm/pkg-web/nanocodex.js";
-import { createBrowserHost } from "../../../bindings/wasm/browser/host.mjs";
+import { Agent } from "nanocodex/browser";
 
-type StartMessage = {
-  type: "start";
-  thinking: "low" | "medium" | "high" | "xhigh";
-};
+import {
+  createExampleAgentController,
+  type ExamplePayment,
+} from "./agentController";
+import { createPaymentSessionOwner } from "./paymentSessionOwner";
+import type {
+  AgentWorkerCommand,
+  AgentWorkerMessage,
+  StartMessage,
+} from "./protocol";
 
-type PromptMessage = {
-  type: "prompt";
-  id: number;
-  prompt: string;
-};
-
-type IncomingMessage = StartMessage | PromptMessage;
+type PaymentSession = Awaited<
+  ReturnType<(typeof import("./tempo"))["createTempoMppSession"]>
+>;
 
 const worker = self as DedicatedWorkerGlobalScope;
-
-const hostGlobal = globalThis as typeof globalThis & { nanocodexHost: unknown };
-hostGlobal.nanocodexHost = createBrowserHost({
-  // Browser WebSockets cannot attach an Authorization header. The URL must be
-  // authorized by the embedding application, for example through a short-lived
-  // signed URL or same-site session cookie.
-  createWebSocket: (endpoint: string, sessionId: string) => {
-    const url = new URL(endpoint);
-    url.searchParams.set("session_id", sessionId);
-    return new WebSocket(url);
-  },
-  onEvent: (eventJson: string) => {
-    worker.postMessage({ type: "event", event: JSON.parse(eventJson) });
-  },
-  tools: {
-    browserInfo: {
-      description: "Return basic information about the browser Worker runtime.",
-      parameters: { type: "object", additionalProperties: false },
-      handler: async () => ({
-        language: navigator.language,
-        online: navigator.onLine,
-        userAgent: navigator.userAgent,
-      }),
-    },
-  },
+const paymentSessions = createPaymentSessionOwner<PaymentSession>();
+const controller = createExampleAgentController({
+  createAgent,
+  postMessage: (message) => worker.postMessage(message),
 });
+let commands = Promise.resolve();
 
-await init();
-
-let agent: Nanocodex | undefined;
-
-worker.onmessage = ({ data }: MessageEvent<IncomingMessage>) => {
-  if (data.type === "start") {
-    agent?.free();
-    agent = new Nanocodex(JSON.stringify({
-      api_key: "worker-managed",
-      websocket_url: workerEndpoint(),
-      thinking: data.thinking,
-      workspace: "/browser",
-    }));
-    worker.postMessage({ type: "ready" });
-    return;
-  }
-
-  const current = agent;
-  if (!current) {
-    worker.postMessage({ type: "error", id: data.id, message: "Start the agent first." });
-    return;
-  }
-
-  // Each prompt gets an independent Turn, while the owned agent serializes
-  // them onto the same session and preserves all follow-on context.
-  const turn = current.prompt(data.prompt);
-  void turn.result().then(
-    (message) => worker.postMessage({ type: "result", id: data.id, message }),
-    (error) => worker.postMessage({
-      type: "error",
-      id: data.id,
-      message: error instanceof Error ? error.message : String(error),
-    }),
-  );
+worker.onmessage = ({ data }: MessageEvent<AgentWorkerCommand>) => {
+  commands = commands
+    .then(() => controller.handle(data))
+    .catch((error) => {
+      const message: AgentWorkerMessage = {
+        type: "error",
+        ...("id" in data ? { id: data.id } : {}),
+        message: errorMessage(error),
+      };
+      worker.postMessage(message);
+    });
 };
+
+async function createAgent(data: StartMessage) {
+  await paymentSessions.clear();
+  const common = {
+    tools: {
+      browserInfo: {
+        description: "Return basic information about the browser Worker runtime.",
+        parameters: { type: "object", additionalProperties: false },
+        handler: async () => ({
+          language: navigator.language,
+          online: navigator.onLine,
+          userAgent: navigator.userAgent,
+        }),
+      },
+    },
+    thinking: data.thinking,
+    reasoningMode: data.reasoningMode,
+  };
+  if (data.transport === "mpp") {
+    const { createTempoMppSession } = await import("./tempo");
+    return paymentSessions.open(
+      createTempoMppSession,
+      async (paymentSession) => {
+        const agent = await Agent.create({
+          ...common,
+          mpp: paymentSession.mpp,
+        });
+        const payment: ExamplePayment = {
+          rootAddress: paymentSession.rootAddress,
+          accessKeyAddress: paymentSession.accessKeyAddress,
+          get channelId() {
+            return paymentSession.mpp.channelId;
+          },
+          cumulative: () => paymentSession.mpp.cumulative.toString(),
+        };
+        return { agent, payment };
+      },
+    );
+  }
+  return {
+    agent: await Agent.create({
+      ...common,
+      apiKey: "worker-managed",
+      websocketUrl: workerEndpoint(),
+      createWebSocket: (endpoint: string, sessionId: string) => {
+        const url = new URL(endpoint);
+        url.searchParams.set("session_id", sessionId);
+        return new WebSocket(url);
+      },
+    }),
+  };
+}
 
 function workerEndpoint(): string {
   const protocol = self.location.protocol === "https:" ? "wss:" : "ws:";
   return `${protocol}//${self.location.host}/api/responses`;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

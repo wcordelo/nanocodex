@@ -4,39 +4,39 @@ use clap::{Args, ValueEnum, builder::NonEmptyStringValueParser};
 use eyre::Result;
 use nanocodex_observability::{LogFormat, LogOutput, ObservabilityBuilder, ObservabilityGuard};
 
-const DEFAULT_FILTER: &str =
-    "warn,nanocodex=info,nanocodex_service=info,nanocodex_tools=info,nanocodex_mcp=info";
+const DEFAULT_FILTER: &str = "warn,nanocodex=info,nanocodex_oai_api=info,nanocodex_tools=info,nanocodex_vm=info,mpp_egress=info";
 
 #[derive(Args)]
 pub(crate) struct ObservabilityArgs {
     /// Tracing filter directive. Defaults to Nanocodex lifecycle spans at info.
     #[arg(
         long,
-        global = true,
         env = "RUST_LOG",
         default_value = DEFAULT_FILTER,
         value_parser = NonEmptyStringValueParser::new()
     )]
     log_filter: String,
 
-    /// Local tracing output format.
+    /// Tracing filter applied only to exported OpenTelemetry spans.
     #[arg(
         long,
-        global = true,
-        env = "NANOCODEX_LOG_FORMAT",
-        default_value_t,
-        value_enum
+        env = "OTEL_LEVEL",
+        default_value = DEFAULT_FILTER,
+        value_parser = NonEmptyStringValueParser::new()
     )]
+    otel_filter: String,
+
+    /// Local tracing output format.
+    #[arg(long, env = "NANOCODEX_LOG_FORMAT", default_value_t, value_enum)]
     log_format: LogFormatArg,
 
     /// Append local tracing output to this file instead of stderr.
-    #[arg(long, global = true, env = "NANOCODEX_LOG_FILE")]
+    #[arg(long, env = "NANOCODEX_LOG_FILE")]
     log_file: Option<PathBuf>,
 
     /// Export spans through OTLP/HTTP protobuf.
     #[arg(
         long,
-        global = true,
         env = "OTEL_EXPORTER_OTLP_ENDPOINT",
         value_parser = NonEmptyStringValueParser::new()
     )]
@@ -45,7 +45,6 @@ pub(crate) struct ObservabilityArgs {
     /// Deployment environment attached to exported spans.
     #[arg(
         long,
-        global = true,
         env = "OTEL_DEPLOYMENT_ENVIRONMENT",
         default_value = "development",
         value_parser = NonEmptyStringValueParser::new()
@@ -75,6 +74,7 @@ impl ObservabilityArgs {
         );
         let mut builder = ObservabilityBuilder::new("nanocodex", env!("CARGO_PKG_VERSION"))
             .filter(self.log_filter)
+            .otel_filter(self.otel_filter)
             .format(self.log_format.into())
             .output(output)
             .environment(self.otel_environment);

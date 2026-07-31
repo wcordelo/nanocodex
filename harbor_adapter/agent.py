@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shlex
-import sys
 import tempfile
 import time
 from pathlib import Path
@@ -42,12 +42,80 @@ RUN_METRIC_FIELDS = (
 USAGE_METRIC_FIELDS = ("cache_write_input_tokens", "reasoning_output_tokens")
 
 
+def _cli_tools_install_command(*, install_node: bool) -> str:
+    """Build a portable installer for the stock Codex task-side CLI toolset."""
+    packages = ["ca-certificates", "curl", "bash", "ripgrep"]
+    checks = ["curl", "bash", "rg"]
+    node_modules_cleanup = ""
+    if install_node:
+        packages.extend(("nodejs", "npm"))
+        checks.extend(("node", "npm"))
+        # FastDockerEnvironment exposes missing system Node modules through
+        # read-only symlinks into its shared toolbox. Remove only those links
+        # before the task package manager installs its writable Node tree.
+        node_modules_cleanup = (
+            "if [ -L /usr/share/nodejs ] && "
+            '[ "$(readlink /usr/share/nodejs)" = '
+            '"/opt/nanocodex-toolbox/usr/share/nodejs" ]; then '
+            "rm /usr/share/nodejs && mkdir -p /usr/share/nodejs; "
+            "elif [ -d /usr/share/nodejs ]; then "
+            "for node_module_entry in /usr/share/nodejs/*; do "
+            '[ -L "$node_module_entry" ] || continue; '
+            'case "$(readlink "$node_module_entry")" in '
+            "/opt/nanocodex-toolbox/usr/share/nodejs/*) "
+            'rm "$node_module_entry" ;; '
+            "esac; done; fi; "
+        )
+
+    package_list = " ".join(packages)
+    command_checks = "; ".join(
+        f"command -v {command} >/dev/null 2>&1" for command in checks
+    )
+    return (
+        node_modules_cleanup
+        + "if ldd --version 2>&1 | grep -qi musl || "
+        "[ -f /etc/alpine-release ]; then "
+        f"apk add --no-cache {package_list}; "
+        "elif command -v apt-get >/dev/null 2>&1; then "
+        "apt-get update && DEBIAN_FRONTEND=noninteractive "
+        "apt-get install --yes --no-install-recommends "
+        f"{package_list}; "
+        "elif command -v yum >/dev/null 2>&1; then "
+        f"yum install -y {package_list}; "
+        "else "
+        "echo 'No supported package manager found; checking preinstalled tools' >&2; "
+        "fi; "
+        f"{command_checks}"
+    )
+
+
+def _remote_binary_install_command(
+    *, binary_url: str, binary_sha256: str, destination: str
+) -> str:
+    """Download one immutable binary inside the Harbor environment."""
+    return (
+        "temporary=$(mktemp); "
+        'trap \'rm -f "$temporary"\' EXIT; '
+        "curl --fail --location --retry 5 --retry-all-errors "
+        f'--output "$temporary" {shlex.quote(binary_url)}; '
+        "if command -v sha256sum >/dev/null 2>&1; then "
+        'actual=$(sha256sum "$temporary" | awk \'{ print $1 }\'); '
+        "elif command -v shasum >/dev/null 2>&1; then "
+        'actual=$(shasum -a 256 "$temporary" | awk \'{ print $1 }\'); '
+        "else echo 'no SHA-256 implementation found' >&2; exit 1; fi; "
+        f"test \"$actual\" = {shlex.quote(binary_sha256)}; "
+        f'cp "$temporary" {shlex.quote(destination)}; '
+        f"chmod 0755 {shlex.quote(destination)}"
+    )
+
+
 class NanocodexAgent(BaseInstalledAgent):
     """Upload one Rust binary, run it once, and retain its JSONL."""
 
     SUPPORTS_ATIF = True
     _BINARY = "/installed-agent/nanocodex"
     _EVENTS = "/logs/agent/events.jsonl"
+    _EVENTS_TMP = "/logs/agent/events.jsonl.tmp"
     _STDERR = "/logs/agent/stderr.log"
     _API_KEY_FILE = "/installed-agent/.openai-api-key"
     _REMOTE_AGENTS_MD = "/app/AGENTS.md"
@@ -56,9 +124,12 @@ class NanocodexAgent(BaseInstalledAgent):
         self,
         logs_dir: Path,
         binary_path: str | Path = ".nanocodex/installed/nanocodex",
+        binary_url: str | None = None,
+        binary_sha256: str | None = None,
         model_name: str | None = None,
         effort: str = "low",
         web_search: bool = True,
+        subagents: bool = False,
         install_node: bool = False,
         system_prompt_path: str | Path | None = None,
         agents_md_path: str | Path | None = None,
@@ -76,17 +147,32 @@ class NanocodexAgent(BaseInstalledAgent):
             **kwargs,
         )
         self._binary_path = Path(binary_path).resolve()
+        if (binary_url is None) != (binary_sha256 is None):
+            raise ValueError("binary_url and binary_sha256 must be configured together")
+        if binary_url is not None and not binary_url.startswith("https://"):
+            raise ValueError("binary_url must use HTTPS")
+        if binary_sha256 is not None and not re.fullmatch(
+            r"[0-9a-fA-F]{64}", binary_sha256
+        ):
+            raise ValueError("binary_sha256 must contain 64 hexadecimal characters")
+        self._binary_url = binary_url
+        self._binary_sha256 = (
+            binary_sha256.lower() if binary_sha256 is not None else None
+        )
         self._model = self._api_model_name(model_name)
         if self._model != MODEL:
             raise ValueError(f"nanocodex supports only {MODEL}, got {self._model}")
         self._effort = effort
         self._web_search = web_search
+        self._subagents = subagents
         self._install_node = install_node
         self._system_prompt_path = self._resolve_context_file(
             system_prompt_path, "system prompt"
         )
         self._agents_md_path = self._resolve_context_file(agents_md_path, "AGENTS.md")
         self._run_interrupted = False
+        self._run_failed = False
+        self._post_run_validation_failed = False
 
     @staticmethod
     def name() -> str:
@@ -96,23 +182,29 @@ class NanocodexAgent(BaseInstalledAgent):
         return f"{self._BINARY} --version"
 
     async def install(self, environment: BaseEnvironment) -> None:
-        if not self._binary_path.is_file():
+        binary_url = getattr(self, "_binary_url", None)
+        binary_sha256 = getattr(self, "_binary_sha256", None)
+        if binary_url is None and not self._binary_path.is_file():
             raise RuntimeError(
                 f"missing nanocodex binary at {self._binary_path}; run `just build-agent`"
             )
-        if self._install_node:
+        await self.exec_as_root(
+            environment,
+            _cli_tools_install_command(install_node=self._install_node),
+            env={"DEBIAN_FRONTEND": "noninteractive"},
+        )
+        if binary_url is not None and binary_sha256 is not None:
             await self.exec_as_root(
                 environment,
-                "if ! command -v node >/dev/null 2>&1; then "
-                "command -v apt-get >/dev/null 2>&1 || { "
-                "echo 'Node.js is missing and this image has no apt-get' >&2; "
-                "exit 1; }; "
-                "apt-get update && DEBIAN_FRONTEND=noninteractive "
-                "apt-get install --yes --no-install-recommends nodejs; "
-                "fi; node --version",
+                _remote_binary_install_command(
+                    binary_url=binary_url,
+                    binary_sha256=binary_sha256,
+                    destination=self._BINARY,
+                ),
             )
-        await environment.upload_file(self._binary_path, self._BINARY)
-        await self.exec_as_root(environment, f"chmod 0755 {self._BINARY}")
+        else:
+            await environment.upload_file(self._binary_path, self._BINARY)
+            await self.exec_as_root(environment, f"chmod 0755 {self._BINARY}")
 
     async def _stage_api_key(self, environment: BaseEnvironment) -> None:
         identity = await self.exec_as_agent(environment, "id -u")
@@ -159,10 +251,15 @@ class NanocodexAgent(BaseInstalledAgent):
         context: AgentContext,
     ) -> None:
         self._run_interrupted = False
+        self._run_failed = False
+        self._post_run_validation_failed = False
         try:
             await self._run_to_completion(instruction, environment, context)
         except asyncio.CancelledError:
             self._run_interrupted = True
+            raise
+        except Exception:
+            self._run_failed = True
             raise
 
     async def _run_to_completion(
@@ -179,22 +276,29 @@ class NanocodexAgent(BaseInstalledAgent):
         )
         await self._stage_agents_md(environment)
         arguments = self._run_arguments(instruction)
-        command = (
+        agent_command = (
             f'api_key=$(<{self._API_KEY_FILE}) && test -n "$api_key" && '
             f'rm -f {self._API_KEY_FILE} && OPENAI_API_KEY="$api_key" '
-            "PATH=$PATH:/opt/nanocodex-verifier/bin "
+            + (
+                "NANOCODEX_SUBAGENT_JSONL=1 "
+                if getattr(self, "_subagents", False)
+                else ""
+            )
+            + "PATH=$PATH:/opt/nanocodex-verifier/bin "
             + " ".join(shlex.quote(argument) for argument in arguments)
-            + f" 2> {self._STDERR} | tee {self._EVENTS}"
+        )
+        command = (
+            f"events_tmp={shlex.quote(self._EVENTS_TMP)}; "
+            'rm -f "$events_tmp"; set +e; set -o pipefail; '
+            f'{agent_command} 2> {shlex.quote(self._STDERR)} | tee "$events_tmp"; '
+            'exit "$?"'
         )
         try:
             await self._stage_api_key(environment)
             result = await self.exec_as_agent(environment, command)
         finally:
             await self._remove_staged_api_key(environment)
-        if result.stdout:
-            print(result.stdout, end="", flush=True)
-        if result.stderr:
-            print(result.stderr, end="", file=sys.stderr, flush=True)
+        self._publish_events(result.stdout)
 
     def _run_arguments(self, prompt: str) -> list[str]:
         return [
@@ -204,17 +308,49 @@ class NanocodexAgent(BaseInstalledAgent):
             self._effort,
             "--web-search",
             str(self._web_search).lower(),
+            "--subagents",
+            str(getattr(self, "_subagents", False)).lower(),
+            "--",
             prompt,
         ]
 
+    def _classify_exec_error(self, command: str, result: Any) -> Exception:
+        # BaseInstalledAgent classifies and raises before returning a nonzero
+        # ExecResult. Publish its complete captured stdout on this path too so
+        # post-run trajectory construction never reads a bind-mounted writer.
+        self._publish_events(result.stdout)
+        return super()._classify_exec_error(command, result)
+
+    def _publish_events(self, stdout: str | None) -> None:
+        if stdout is None:
+            return
+        events = self.logs_dir / Path(self._EVENTS).name
+        temporary = events.with_name(f"{events.name}.host.tmp")
+        temporary.write_text(stdout, encoding="utf-8")
+        temporary.replace(events)
+        (self.logs_dir / Path(self._EVENTS_TMP).name).unlink(missing_ok=True)
+
     def populate_context_post_run(self, context: AgentContext) -> None:
+        if getattr(self, "_post_run_validation_failed", False):
+            self.logger.debug(
+                "skipping repeated nanocodex trajectory validation during recovery"
+            )
+            return
         try:
             self._populate_context_post_run_strict(context)
         except Exception:
-            if not self._run_interrupted:
+            if not (
+                getattr(self, "_run_interrupted", False)
+                or getattr(self, "_run_failed", False)
+            ):
+                # Harbor records the first validation failure on the trial, then
+                # calls this hook again while recovering outputs. Preserve the
+                # original strict failure but do not let the recovery pass raise
+                # a second time and cancel the entire concurrent job.
+                self._post_run_validation_failed = True
                 raise
             self.logger.debug(
-                "skipping strict nanocodex trajectory validation after run cancellation",
+                "skipping strict nanocodex trajectory validation after an incomplete run",
                 exc_info=True,
             )
 
@@ -387,7 +523,7 @@ class NanocodexAgent(BaseInstalledAgent):
 
         if system_prompt_path is not None:
             expected = system_prompt_path.read_text(encoding="utf-8").strip()
-            if expected not in input_texts:
+            if expected not in (text.strip() for text in input_texts):
                 raise RuntimeError(
                     "the nanocodex request did not contain the configured system prompt "
                     "byte-for-byte; rebuild the installed agent"
@@ -481,23 +617,31 @@ class NanocodexAgent(BaseInstalledAgent):
 
     @staticmethod
     def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-        error: OSError | json.JSONDecodeError | None = None
-        values: list[Any] = []
-        for attempt in range(10):
+        deadline = time.monotonic() + 30.0
+        while True:
             try:
+                text = path.read_text(encoding="utf-8")
                 values = [
                     json.loads(line)
-                    for line in path.read_text(encoding="utf-8").splitlines()
+                    for line in text.splitlines()
                     if line.strip()
                 ]
-                error = None
                 break
-            except (OSError, json.JSONDecodeError) as current_error:
-                error = current_error
-                if attempt < 9:
-                    time.sleep(0.05)
-        if error is not None:
-            raise RuntimeError(f"failed to read JSONL from {path}: {error}") from error
+            except OSError as error:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"failed to read JSONL from {path}: {error}"
+                    ) from error
+                time.sleep(0.05)
+            except json.JSONDecodeError as error:
+                # A bind-mounted file can become visible before its current final
+                # record. Stable malformed JSONL ends in a newline and should fail
+                # immediately; a partial EOF is allowed time to finish propagating.
+                if text.endswith(("\n", "\r")) or time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"failed to read JSONL from {path}: {error}"
+                    ) from error
+                time.sleep(0.05)
         if not all(isinstance(value, dict) for value in values):
             raise RuntimeError(f"all JSONL values in {path} must be objects")
         return values

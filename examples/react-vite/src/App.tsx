@@ -1,15 +1,33 @@
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import {
+  FormEvent,
+  Suspense,
+  lazy,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
-type Thinking = "low" | "medium" | "high" | "xhigh";
+import type { MppConnection } from "./MppControls";
+import type {
+  AgentWorkerMessage as WorkerMessage,
+} from "./protocol";
+import type {
+  AgentEvent,
+  Thinking,
+} from "nanocodex";
+import {
+  appendRetainedEvents,
+  summarizeEventBatch,
+} from "./eventBatch";
+
+const MppControls = lazy(async () => ({
+  default: (await import("./MppControls")).MppControls,
+}));
+
 type Status = "waiting" | "starting" | "ready" | "running" | "completed" | "failed";
 type JsonObject = Record<string, unknown>;
-type AgentEvent = {
-  protocol_version: number;
-  request_id: string;
-  seq: number;
-  type: string;
-  payload: JsonObject;
-};
 type TranscriptItem = {
   id: number;
   role: "user" | "assistant" | "error";
@@ -23,19 +41,16 @@ type ToolTrace = {
   status?: string;
   duration_ns?: number;
 };
-type WorkerMessage =
-  | { type: "ready" }
-  | { type: "event"; event: AgentEvent }
-  | { type: "result"; id: number; message: string }
-  | { type: "error"; id?: number; message: string };
-
 const DEFAULT_PROMPT = `Inspect the browser runtime with tools.browserInfo(), then explain what is running in Rust/WASM versus JavaScript. End with one concrete idea for a useful browser-native tool.`;
 
 export function App() {
   const workerRef = useRef<Worker | null>(null);
+  const eventQueue = useRef<AgentEvent[]>([]);
+  const eventFrame = useRef<number | undefined>(undefined);
   const nextId = useRef(1);
   const startedAt = useRef(0);
-  const [thinking, setThinking] = useState<Thinking>("medium");
+  const [thinking, setThinking] = useState<Thinking>("high");
+  const [transport, setTransport] = useState<"openai" | "mpp">("openai");
   const [status, setStatus] = useState<Status>("waiting");
   const [ready, setReady] = useState(false);
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT);
@@ -45,41 +60,74 @@ export function App() {
   const [liveAnswer, setLiveAnswer] = useState("");
   const [reasoning, setReasoning] = useState("");
   const [elapsedMs, setElapsedMs] = useState(0);
+  const [payment, setPayment] = useState<{ rootAddress?: string; accessKeyAddress?: string; channelId?: string; cumulative?: string }>({});
+  const [mppConnection, setMppConnection] = useState<MppConnection>();
+  const updateMppConnection = useCallback(
+    (connection: MppConnection | undefined) => setMppConnection(connection),
+    [],
+  );
+  const flushEvents = useCallback(() => {
+    if (eventFrame.current !== undefined) {
+      cancelAnimationFrame(eventFrame.current);
+      eventFrame.current = undefined;
+    }
+    const queued = eventQueue.current;
+    eventQueue.current = [];
+    if (!queued.length) return;
+    const summary = summarizeEventBatch(
+      queued,
+      startedAt.current,
+      Date.now(),
+    );
+    setEvents((current) => appendRetainedEvents(current, queued));
+    const assistant = summary.assistant;
+    if (assistant) {
+      setLiveAnswer((current) => assistant.mode === "replace"
+        ? assistant.text
+        : current + assistant.text);
+    }
+    if (summary.reasoning) {
+      setReasoning((current) => current + summary.reasoning);
+    }
+    if (summary.status) setStatus(summary.status);
+    if (summary.elapsedMs !== undefined) setElapsedMs(summary.elapsedMs);
+    if (summary.errors.length) {
+      setTranscript((current) => [
+        ...current,
+        ...summary.errors.map((text) => ({
+          id: nextId.current++,
+          role: "error" as const,
+          text,
+        })),
+      ]);
+    }
+  }, []);
 
   useEffect(() => {
     const worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" });
     workerRef.current = worker;
     worker.onmessage = ({ data }: MessageEvent<WorkerMessage>) => {
       if (data.type === "ready") {
+        setPayment(data.transport === "mpp" ? {
+          rootAddress: data.rootAddress,
+          accessKeyAddress: data.accessKeyAddress,
+          channelId: data.channelId,
+        } : {});
         setReady(true);
         setStatus("ready");
         return;
       }
       if (data.type === "event") {
-        const event = data.event;
-        setEvents((current) => [...current.slice(-499), event]);
-        if (event.type === "run.started") {
-          setStatus("running");
-        } else if (event.type === "assistant.delta") {
-          setLiveAnswer((current) => current + payloadText(event));
-        } else if (event.type === "assistant.message") {
-          setLiveAnswer(payloadText(event));
-        } else if (event.type === "reasoning.summary.delta") {
-          setReasoning((current) => current + payloadText(event));
-        } else if (event.type === "run.completed") {
-          setStatus("completed");
-          setElapsedMs(payloadNumber(event.payload, "duration_ms") ?? Date.now() - startedAt.current);
-        } else if (event.type === "run.failed") {
-          setStatus("failed");
-          setElapsedMs(payloadNumber(event.payload, "duration_ms") ?? Date.now() - startedAt.current);
-        } else if (event.type === "run.error") {
-          const message = payloadString(event.payload, "message") ?? "The run failed.";
-          setTranscript((current) => [...current, { id: nextId.current++, role: "error", text: message }]);
-        }
+        eventQueue.current.push(data.event);
+        eventFrame.current ??= requestAnimationFrame(flushEvents);
         return;
       }
+      flushEvents();
       if (data.type === "result") {
+        if (data.payment) setPayment((current) => ({ ...current, ...data.payment }));
         setPending((current) => without(current, data.id));
+        setStatus("completed");
+        setElapsedMs(Date.now() - startedAt.current);
         setLiveAnswer(data.message);
         setTranscript((current) => [
           ...current,
@@ -89,13 +137,28 @@ export function App() {
       }
       if (data.id !== undefined) setPending((current) => without(current, data.id!));
       setStatus("failed");
-      setTranscript((current) => [
-        ...current,
-        { id: data.id ?? nextId.current++, role: "error", text: data.message },
-      ]);
+      setTranscript((current) => {
+        const tail = current.at(-1);
+        return tail?.role === "error" && tail.text === data.message
+          ? current
+          : [
+              ...current,
+              {
+                id: data.id ?? nextId.current++,
+                role: "error",
+                text: data.message,
+              },
+            ];
+      });
     };
-    return () => worker.terminate();
-  }, []);
+    return () => {
+      if (eventFrame.current !== undefined) {
+        cancelAnimationFrame(eventFrame.current);
+      }
+      eventQueue.current = [];
+      worker.terminate();
+    };
+  }, [flushEvents]);
 
   useEffect(() => {
     if (status !== "running") return;
@@ -111,8 +174,13 @@ export function App() {
   const stats = asObject(terminal?.payload.stats);
   const usage = asObject(stats?.usage);
 
-  function start(event: FormEvent) {
+  async function start(event: FormEvent) {
     event.preventDefault();
+    if (eventFrame.current !== undefined) {
+      cancelAnimationFrame(eventFrame.current);
+      eventFrame.current = undefined;
+    }
+    eventQueue.current = [];
     setReady(false);
     setStatus("starting");
     setPending(new Set());
@@ -121,7 +189,20 @@ export function App() {
     setLiveAnswer("");
     setReasoning("");
     setElapsedMs(0);
-    workerRef.current?.postMessage({ type: "start", thinking });
+    try {
+      if (transport === "mpp") {
+        if (!mppConnection) {
+          throw new Error("Tempo Wallet integration is still loading");
+        }
+        setPayment({ rootAddress: await mppConnection.start() });
+      } else {
+        setPayment({});
+      }
+      workerRef.current?.postMessage({ type: "start", thinking, transport });
+    } catch (error) {
+      setStatus("failed");
+      setTranscript([{ id: nextId.current++, role: "error", text: error instanceof Error ? error.message : String(error) }]);
+    }
   }
 
   function submit(event: FormEvent) {
@@ -148,27 +229,45 @@ export function App() {
           <h1>The agent loop,<br /><em>inside your browser.</em></h1>
           <p className="lede">
             React drives a dedicated Worker. Rust/WASM owns the persistent Responses session,
-            typed history, and tool loop. A Cloudflare Worker holds the API secret at the edge.
+            typed history, and tool loop. Choose the normal OpenAI path or opt into Tempo MPP.
           </p>
         </div>
         <div className="architecture" aria-label="Runtime architecture">
           <RuntimeStep number="01" title="React" note="controls + live trace" />
           <RuntimeStep number="02" title="Web Worker" note="isolated host boundary" />
           <RuntimeStep number="03" title="Rust / WASM" note="session + model loop" active />
-          <RuntimeStep number="04" title="CF Worker API" note="secret-bound upgrade" />
-          <RuntimeStep number="05" title="OpenAI Responses" note="default WebSocket API" />
+          {transport === "mpp" ? (
+            <>
+              <RuntimeStep number="04" title="Tempo MPP" note="reused paid channel" />
+              <RuntimeStep number="05" title="OpenAI Responses" note="keyless paid WebSocket" />
+            </>
+          ) : (
+            <>
+              <RuntimeStep number="04" title="CF Worker API" note="secret-bound upgrade" />
+              <RuntimeStep number="05" title="OpenAI Responses" note="API-key WebSocket" />
+            </>
+          )}
         </div>
       </header>
 
       <section className="control-panel">
         <form className="connection-controls" onSubmit={start}>
           <label className="endpoint-field">
-            <span>OpenAI Responses WebSocket</span>
+            <span>{transport === "mpp" ? "MPP Responses WebSocket" : "OpenAI Responses WebSocket"}</span>
             <input
-              value="wss://api.openai.com/v1/responses"
+              value={transport === "mpp"
+                ? "wss://openai.mpp.tempo.xyz/v1/responses"
+                : "wss://api.openai.com/v1/responses"}
               readOnly
               aria-label="Default OpenAI Responses WebSocket endpoint"
             />
+          </label>
+          <label>
+            <span>Payment</span>
+            <select value={transport} onChange={(event) => setTransport(event.target.value as "openai" | "mpp") }>
+              <option value="openai">OpenAI API key</option>
+              <option value="mpp">Tempo MPP</option>
+            </select>
           </label>
           <label>
             <span>Reasoning</span>
@@ -179,8 +278,21 @@ export function App() {
               <option value="xhigh">xhigh</option>
             </select>
           </label>
-          <button className="connect" type="submit">{ready ? "Reset session" : "Start agent"}</button>
+          <button
+            className="connect"
+            type="submit"
+            disabled={transport === "mpp" && !mppConnection}
+          >
+            {transport === "mpp" && !mppConnection
+              ? "Loading Tempo…"
+              : ready ? "Reset session" : "Start agent"}
+          </button>
         </form>
+        {transport === "mpp" ? (
+          <Suspense fallback={null}>
+            <MppControls onChange={updateMppConnection} />
+          </Suspense>
+        ) : null}
 
         <div className="panel-divider" />
 
@@ -198,7 +310,17 @@ export function App() {
             placeholder="Start the agent, then send a prompt."
           />
           <div className="run-row">
-            <p><code>OPENAI_API_KEY</code> is a Worker secret binding; no credential enters this page.</p>
+            {transport === "mpp" ? (
+              <div>
+                <p>
+                  Tempo root <code>{shortAddress(payment.rootAddress)}</code> delegates to access key{" "}
+                  <code>{shortAddress(payment.accessKeyAddress)}</code>.
+                </p>
+                {payment.channelId && <p>Reusable MPP channel <code>{shortAddress(payment.channelId)}</code>.</p>}
+              </div>
+            ) : (
+              <p><code>OPENAI_API_KEY</code> stays in the Worker secret binding and never enters the page.</p>
+            )}
             <div className="run-controls">
               <span className={`status status-${status}`}>{status}</span>
               <button className="run" type="submit" disabled={!ready || !prompt.trim()}>
@@ -215,6 +337,12 @@ export function App() {
         <Metric label="Tool calls" value={formatNumber(stats?.tool_calls ?? tools.length)} />
         <Metric label="Total tokens" value={formatNumber(usage?.total_tokens)} />
         <Metric label="WS connects" value={formatNumber(stats?.connection_attempts ?? count(events, "model.connection.completed"))} />
+        {transport === "mpp" && (
+          <Metric label="MPP paid" value={payment.cumulative ? `${Number(payment.cumulative) / 1_000_000}` : "—"} />
+        )}
+        {transport === "mpp" && (
+          <Metric label="PathUSD available" value={mppConnection?.balance ?? "—"} />
+        )}
       </section>
 
       <section className="workspace-grid">
@@ -328,10 +456,6 @@ function isLifecycleEvent(event: AgentEvent): boolean {
   ].includes(event.type);
 }
 
-function payloadText(event: AgentEvent): string {
-  return payloadString(event.payload, "text") ?? "";
-}
-
 function payloadString(payload: JsonObject, key: string): string | undefined {
   return typeof payload[key] === "string" ? payload[key] : undefined;
 }
@@ -359,6 +483,10 @@ function formatNs(nanoseconds: number): string {
 
 function formatNumber(value: unknown): string {
   return typeof value === "number" ? value.toLocaleString() : "—";
+}
+
+function shortAddress(value: string | undefined): string {
+  return value ? `${value.slice(0, 6)}…${value.slice(-4)}` : "not connected";
 }
 
 function formatJson(value: unknown): string {

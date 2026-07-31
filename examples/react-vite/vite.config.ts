@@ -7,11 +7,14 @@ const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
 
 export default defineConfig({
   plugins: [react(), cloudflare()],
+  build: {
+    manifest: true,
+  },
   worker: { format: "es" },
   server: {
     fs: {
       // The example consumes the generated WASM package and browser host from
-      // bindings/wasm without copying either artifact into the application.
+      // js/bindings without copying either artifact into the application.
       allow: [repositoryRoot],
     },
   },

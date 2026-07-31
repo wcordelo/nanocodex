@@ -16,13 +16,109 @@ from unittest.mock import AsyncMock
 import yaml
 from harbor.models.agent.context import AgentContext
 
-from harbor_adapter.agent import NanocodexAgent
+from harbor_adapter.agent import (
+    NanocodexAgent,
+    _cli_tools_install_command,
+    _remote_binary_install_command,
+)
 from harbor_adapter.codex import ParityCodexAgent
 from harbor_adapter.environment import _toolbox_mount_setup_command
 from harbor_adapter.verifier import (
     _VERIFIER_OVERLAY_PATH_VALIDATION,
     _toolbox_library_path_setup_command,
 )
+
+
+class CliToolInstallContractTests(unittest.TestCase):
+    def test_leaderboard_install_provisions_the_codex_cli_toolset_and_cas(self) -> None:
+        command = _cli_tools_install_command(install_node=True)
+
+        for package in (
+            "ca-certificates",
+            "curl",
+            "bash",
+            "nodejs",
+            "npm",
+            "ripgrep",
+        ):
+            self.assertIn(package, command)
+        for package_manager in ("apk add", "apt-get install", "yum install"):
+            self.assertIn(package_manager, command)
+        for executable in ("curl", "bash", "node", "npm", "rg"):
+            self.assertIn(f"command -v {executable}", command)
+        self.assertIn(
+            '"/opt/nanocodex-toolbox/usr/share/nodejs"',
+            command,
+        )
+        self.assertIn('rm "$node_module_entry"', command)
+
+    def test_node_policy_keeps_node_and_npm_optional(self) -> None:
+        command = _cli_tools_install_command(install_node=False)
+
+        self.assertNotIn("nodejs", command)
+        self.assertNotIn("/opt/nanocodex-toolbox/usr/share/nodejs", command)
+        self.assertNotIn("command -v node", command)
+        self.assertNotIn("command -v npm", command)
+        for package in ("ca-certificates", "curl", "bash", "ripgrep"):
+            self.assertIn(package, command)
+
+    def test_agent_install_applies_the_tool_policy_before_uploading(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "nanocodex"
+            binary.touch()
+            agent = object.__new__(NanocodexAgent)
+            agent._binary_path = binary
+            agent._install_node = True
+            agent.exec_as_root = AsyncMock()
+            environment = SimpleNamespace(upload_file=AsyncMock())
+
+            asyncio.run(agent.install(environment))
+
+        install_command = agent.exec_as_root.await_args_list[0].args[1]
+        self.assertIn("ca-certificates", install_command)
+        self.assertIn("nodejs", install_command)
+        self.assertEqual(
+            agent.exec_as_root.await_args_list[0].kwargs["env"],
+            {"DEBIAN_FRONTEND": "noninteractive"},
+        )
+        environment.upload_file.assert_awaited_once_with(binary, agent._BINARY)
+        self.assertEqual(
+            agent.exec_as_root.await_args_list[1].args[1],
+            "chmod 0755 /installed-agent/nanocodex",
+        )
+
+    def test_remote_binary_install_downloads_and_verifies_before_installing(
+        self,
+    ) -> None:
+        checksum = "a" * 64
+        command = _remote_binary_install_command(
+            binary_url="https://example.test/nanocodex",
+            binary_sha256=checksum,
+            destination="/installed-agent/nanocodex",
+        )
+
+        self.assertIn("curl --fail --location --retry 5", command)
+        self.assertIn("https://example.test/nanocodex", command)
+        self.assertIn("sha256sum", command)
+        self.assertIn(checksum, command)
+        self.assertIn("chmod 0755 /installed-agent/nanocodex", command)
+
+    def test_remote_binary_install_skips_controller_upload(self) -> None:
+        agent = object.__new__(NanocodexAgent)
+        agent._binary_path = Path("/missing-on-controller")
+        agent._binary_url = "https://example.test/nanocodex"
+        agent._binary_sha256 = "b" * 64
+        agent._install_node = True
+        agent.exec_as_root = AsyncMock()
+        environment = SimpleNamespace(upload_file=AsyncMock())
+
+        asyncio.run(agent.install(environment))
+
+        environment.upload_file.assert_not_awaited()
+        self.assertEqual(agent.exec_as_root.await_count, 2)
+        download_command = agent.exec_as_root.await_args_list[1].args[1]
+        self.assertIn(agent._binary_url, download_command)
+        self.assertIn(agent._binary_sha256, download_command)
 
 
 class WebSearchContractTests(unittest.TestCase):
@@ -32,15 +128,29 @@ class WebSearchContractTests(unittest.TestCase):
         agent._effort = "low"
 
         agent._web_search = True
+        agent._subagents = False
         self.assertEqual(
-            agent._run_arguments("test prompt")[-3:],
-            ["--web-search", "true", "test prompt"],
+            agent._run_arguments("test prompt")[-6:],
+            ["--web-search", "true", "--subagents", "false", "--", "test prompt"],
         )
 
         agent._web_search = False
+        agent._subagents = True
         self.assertEqual(
-            agent._run_arguments("test prompt")[-3:],
-            ["--web-search", "false", "test prompt"],
+            agent._run_arguments("test prompt")[-6:],
+            ["--web-search", "false", "--subagents", "true", "--", "test prompt"],
+        )
+
+    def test_run_arguments_protect_a_prompt_that_starts_with_a_hyphen(self) -> None:
+        agent = object.__new__(NanocodexAgent)
+        agent._model = "test-model"
+        agent._effort = "low"
+        agent._web_search = False
+        agent._subagents = False
+
+        self.assertEqual(
+            agent._run_arguments("- benchmark instruction")[-2:],
+            ["--", "- benchmark instruction"],
         )
 
     def test_terminal_bench_disables_web_search(self) -> None:
@@ -51,6 +161,16 @@ class WebSearchContractTests(unittest.TestCase):
 
         self.assertIs(config["agents"][0]["kwargs"]["web_search"], False)
 
+    def test_terminal_bench_arms_do_not_enable_subagents(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        for filename in (
+            "terminal-bench-2-1.yaml",
+            "terminal-bench-2-1-high-failures.yaml",
+        ):
+            config = yaml.safe_load(
+                (repository / "evals" / filename).read_text(encoding="utf-8")
+            )
+            self.assertNotIn("subagents", config["agents"][0]["kwargs"])
 
 class ContextParityContractTests(unittest.TestCase):
     def test_history_eval_arms_use_the_same_context_files(self) -> None:
@@ -84,7 +204,7 @@ class ContextParityContractTests(unittest.TestCase):
             agent = ParityCodexAgent(
                 logs_dir=Path(directory),
                 model_name="openai/test-model",
-                system_prompt_path=repository / "crates/nanocodex-core/prompts/system.md",
+                system_prompt_path=repository / "crates/nanocodex-oai-api/prompts/system.md",
                 agents_md_path=repository / "evals/history-derived/AGENTS.md",
                 reasoning_effort="low",
                 web_search="disabled",
@@ -641,6 +761,7 @@ class InterruptedRunContractTests(unittest.TestCase):
         agent = object.__new__(NanocodexAgent)
         agent.logs_dir = logs_dir
         agent._run_interrupted = interrupted
+        agent._run_failed = False
         agent.logger = logging.getLogger("harbor_adapter.test_agent")
         return agent
 
@@ -683,6 +804,21 @@ class InterruptedRunContractTests(unittest.TestCase):
 
             self.assertTrue(context.is_empty())
 
+    def test_empty_stream_is_best_effort_after_agent_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            logs_dir = Path(directory)
+            (logs_dir / "input.jsonl").write_text(
+                json.dumps({"instruction": "test"}) + "\n", encoding="utf-8"
+            )
+            (logs_dir / "events.jsonl").write_text("", encoding="utf-8")
+            agent = self._agent(logs_dir, interrupted=False)
+            agent._run_failed = True
+            context = AgentContext()
+
+            agent.populate_context_post_run(context)
+
+            self.assertTrue(context.is_empty())
+
     def test_malformed_stream_remains_invalid_after_normal_exit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             logs_dir = Path(directory)
@@ -693,14 +829,32 @@ class InterruptedRunContractTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 agent.populate_context_post_run(AgentContext())
 
-    def test_jsonl_read_retries_a_partially_propagated_final_line(self) -> None:
+    def test_recovery_suppresses_a_repeated_normal_exit_validation_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            logs_dir = Path(directory)
+            self._write_partial_stream(logs_dir)
+            (logs_dir / "events.jsonl").write_text("not-json\n", encoding="utf-8")
+            agent = self._agent(logs_dir, interrupted=False)
+
+            with self.assertRaises(RuntimeError):
+                agent.populate_context_post_run(AgentContext())
+
+            context = AgentContext()
+            agent.populate_context_post_run(context)
+
+            self.assertTrue(context.is_empty())
+
+    def test_jsonl_read_retries_a_slowly_propagated_final_line(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "events.jsonl"
             complete = {"type": "run.completed", "payload": {}}
             path.write_text('{"type":"run.com', encoding="utf-8")
 
             def finish_write() -> None:
-                time.sleep(0.02)
+                # Longer than the old adapter's complete retry window.
+                time.sleep(0.6)
                 path.write_text(json.dumps(complete) + "\n", encoding="utf-8")
 
             writer = threading.Thread(target=finish_write)
@@ -710,8 +864,74 @@ class InterruptedRunContractTests(unittest.TestCase):
             finally:
                 writer.join()
 
+    def test_jsonl_read_rejects_stable_malformed_records_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.jsonl"
+            path.write_text("not-json\n", encoding="utf-8")
+
+            started = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, "failed to read JSONL"):
+                NanocodexAgent._read_jsonl(path)
+
+            self.assertLess(time.monotonic() - started, 0.5)
+
 
 class RunCancellationContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_atomically_publishes_captured_stdout_on_the_host(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent = object.__new__(NanocodexAgent)
+            agent.logs_dir = Path(directory)
+            agent.context_id = None
+            agent.session_id = "session-1"
+            agent._model = "test-model"
+            agent._effort = "low"
+            agent._web_search = False
+            agent._subagents = False
+            agent._agents_md_path = None
+            agent._stage_api_key = AsyncMock()
+            agent._remove_staged_api_key = AsyncMock()
+            stream = '{"type":"run.completed","payload":{}}\n'
+            agent.exec_as_agent = AsyncMock(
+                return_value=SimpleNamespace(stdout=stream, stderr="")
+            )
+            environment = SimpleNamespace(capabilities=SimpleNamespace(mounted=True))
+            event_spool = agent.logs_dir / "events.jsonl.tmp"
+            event_spool.write_text(stream, encoding="utf-8")
+
+            await agent.run("test", environment, AgentContext())
+
+            command = agent.exec_as_agent.await_args.args[1]
+            self.assertIn("set -o pipefail", command)
+            self.assertIn('tee "$events_tmp"', command)
+            self.assertNotIn("tee /logs/agent/events.jsonl", command)
+            self.assertNotIn('mv "$events_tmp"', command)
+            self.assertEqual(
+                (agent.logs_dir / "events.jsonl").read_text(encoding="utf-8"),
+                stream,
+            )
+            self.assertFalse((agent.logs_dir / "events.jsonl.host.tmp").exists())
+            self.assertFalse(event_spool.exists())
+
+    def test_nonzero_exit_publishes_captured_stdout_before_classification(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent = object.__new__(NanocodexAgent)
+            agent.logs_dir = Path(directory)
+            agent.logger = logging.getLogger("harbor_adapter.test_agent")
+            agent._compiled_error_patterns = []
+            stream = '{"type":"run.failed","payload":{}}\n'
+            result = SimpleNamespace(return_code=1, stdout=stream, stderr="")
+
+            error = agent._classify_exec_error("test-command", result)
+
+            self.assertIsInstance(error, RuntimeError)
+            self.assertEqual(
+                (agent.logs_dir / "events.jsonl").read_text(encoding="utf-8"),
+                stream,
+            )
+            self.assertFalse((agent.logs_dir / "events.jsonl.host.tmp").exists())
+
     async def test_cancellation_is_recorded_and_reraised(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             agent = object.__new__(NanocodexAgent)

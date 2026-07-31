@@ -3,10 +3,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use nanocodex_core::{CustomToolFormat, ToolDefinition};
+use nanocodex_oai_api::tools::ToolDefinition;
 use serde_json::json;
 
-use super::{Tool, ToolContext, ToolExecution, ToolInput};
+use super::{StandardTool, Tool, ToolContext, ToolInput, ToolOutput, ToolResult};
 
 mod parser;
 mod seek_sequence;
@@ -14,43 +14,34 @@ mod streaming_parser;
 
 use parser::{Hunk, UpdateFileChunk, parse_patch};
 
-const GRAMMAR: &str = include_str!("apply_patch.lark");
-
-pub(super) struct ApplyPatchHandler {
+pub(crate) struct ApplyPatchHandler {
     workspace: PathBuf,
 }
 
 impl ApplyPatchHandler {
-    pub(super) fn new(workspace: PathBuf) -> Self {
+    pub(crate) const fn new(workspace: PathBuf) -> Self {
         Self { workspace }
     }
 }
 
 #[async_trait::async_trait]
 impl Tool for ApplyPatchHandler {
-    fn name(&self) -> &'static str {
-        "apply_patch"
-    }
-
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition::custom(
-            self.name(),
-            "Use the `apply_patch` tool to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.",
-            CustomToolFormat::grammar("lark", GRAMMAR),
-        )
+        StandardTool::ApplyPatch.definition()
     }
 
-    async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolExecution {
-        let input = match input.into_freeform() {
-            Ok(input) => input,
-            Err(error) => return ToolExecution::error(error.to_string()),
-        };
+    async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+        let input = input.into_freeform()?;
         let workspace = self.workspace.clone();
-        match tokio::task::spawn_blocking(move || apply(&input, &workspace)).await {
-            Ok(Ok(output)) => ToolExecution::text(output).with_code_mode_value(json!({})),
-            Ok(Err(error)) => ToolExecution::error(error),
-            Err(error) => ToolExecution::error(format!("apply_patch task failed: {error}")),
-        }
+        Ok(
+            match tokio::task::spawn_blocking(move || apply(&input, &workspace)).await {
+                Ok(Ok(output)) => ToolOutput::text(output).with_code_mode_value(json!({})),
+                Ok(Err(error)) => {
+                    ToolOutput::error(format!("apply_patch verification failed: {error}"))
+                }
+                Err(error) => ToolOutput::error(format!("apply_patch task failed: {error}")),
+            },
+        )
     }
 }
 

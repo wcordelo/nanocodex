@@ -49,21 +49,33 @@
 
 ## Workspace boundaries
 
-- `nanocodex-core` owns dependency-light public data: prompts, events, model
-  configuration, and complete typed Responses wire/domain types.
-- `nanocodex-service` owns behavior at the API boundary: the persistent
-  WebSocket, stream processing, retry policy, telemetry, and generic Tower
-  service/client.
+- `nanocodex-oai-api` owns the complete OpenAI boundary: dependency-light
+  prompts/events/wire types, the managed context state machine, persistent
+  transports, typed retry policy, telemetry, and generic Tower client.
 - `nanocodex-tools` owns code mode, built-in tools, the heterogeneous registry,
-  and the public `Tool` trait.
-- `nanocodex-mcp` owns MCP transports, background handshake/discovery,
-  authenticated connection inputs, deferred tool search, and remote dispatch.
-- `nanocodex` composes those crates into the owned agent lifecycle and exports
-  the ergonomic builders and common types.
-- `nanocodex-macros` implements `#[tool]`. Keep the executable under
-  `bin/nanocodex`; do not move CLI behavior into the library.
+  MCP transports and discovery, deferred tool search, and remote dispatch. MCP
+  is always available on native targets.
+- `nanocodex-agent` owns the private driver, lifecycle policy, branching,
+  snapshots, Codex rollouts, and ergonomic agent builders.
+- `nanocodex` is an Alloy-style facade containing reexports, named component
+  modules, and a small prelude. It contains no runtime implementation.
+- Keep facade imports canonical: common types may appear at the crate root and
+  detailed APIs under their owning `agent`, `oai`, or `tools` module. Do not add
+  sibling convenience reexports.
+- `nanocodex-tools/macros` contains the `nanocodex-tools-macros` package that
+  implements `#[tool]`. Keep the executable under `bin/nanocodex`; do not move
+  CLI behavior into the library.
+- Tempo payment, egress, and `NanoUSD` support stay under `bin/`; public
+  `nanocodex-*` library crates must not depend on them.
+- The unpublished experimental `nanocodex-vm` crate owns the complete VM
+  boundary: the audited libkrun interface, VM/process configuration, gvproxy
+  and provider-neutral egress, OCI/Dockerfile image preparation, and retained
+  host/guest workspace tools. Its guest reuses the canonical local
+  workspace-tool contracts rather than introducing a second tool runtime.
 - Each lower crate must remain useful without importing the higher orchestration
   crate. Avoid circular concepts and leaky socket/runtime types.
+- `scripts/check-crate-boundaries.sh` is the executable dependency policy.
+  Update its snapshot only for a deliberate architecture change.
 
 ## Runtime invariants
 
@@ -72,6 +84,8 @@
   dropped.
 - One agent reuses its WebSocket, typed history, code-mode runtime, shell
   sessions, stable cache key, and response chain across sequential turns.
+- Agent-relative tools are instantiated per driver with weak self capabilities;
+  a fork must never inherit a handler that still targets its parent driver.
 - `prompt().await` waits only for command acceptance and returns an independently
   awaitable `Turn`. Prompt queueing order is owned by the driver.
 - Client-owned typed history is authoritative. Healthy turns send only the new
@@ -79,8 +93,10 @@
   replays complete committed history.
 - Commit only completed responses. A failed partial response must not execute a
   tool or enter history.
-- Preserve `store: false`, stable prompt/cache identity, and byte-stable shared
-  prefixes across turns, retries, compaction, and reconnects.
+- Preserve stable prompt/cache identity and byte-stable shared prefixes across
+  turns, retries, compaction, and reconnects. Stored Responses checkpoints are
+  an optional transport optimization for branching; complete client-owned typed
+  history remains authoritative and is replayed when a checkpoint is missing.
 - Cancellation and process cleanup are explicit. Timeout or cancellation must
   terminate subprocess groups and descendants.
 
@@ -105,8 +121,24 @@
   subscriber. It must never replace contractual events.
 - Do not add a generic event bus, shared mutable collector state, or callback
   framework without a concrete library consumer and an explicit lifecycle.
-- Never emit secrets, `.env` contents, hidden chain of thought, or full prompt
-  bodies into logs or tracing. Retain only API-visible reasoning summaries.
+- Tracing is a full-fidelity record of all data observed by the agent lifecycle.
+  Preserve complete prompts and instructions, model requests and responses,
+  API-visible reasoning content and summaries, opaque encrypted reasoning
+  payloads, tool arguments and results, steering, cancellations, and lifecycle
+  events in their original order. Do not redact, filter, truncate, or omit
+  observed values based on their content or sensitivity.
+- Put large ordered content in span events rather than searchable span
+  attributes. Keep attributes structural: identity, lineage, ordering, sizes,
+  status, timing, token usage, cache behavior, and routing metadata.
+- Follow init4-style span hygiene: a root span represents one bounded unit of
+  work, not a long-lived driver or session. Correlate sequential turn roots with
+  session and lineage attributes. Propagate explicit parents with the work sent
+  across channels, instrument futures before spawning them, and let concurrent
+  child work appear as overlapping sibling branches.
+- Telemetry must observe the normal runtime data path rather than performing
+  additional configuration or environment reads solely to manufacture trace
+  content. Operators must treat the trace backend as a complete copy of agent
+  conversations and tool activity and apply matching access and retention.
 
 ## JSONL adapter contract
 
@@ -138,6 +170,28 @@
   public-example checks. Benchmark performance claims on representative retained
   traces, not synthetic microbenchmarks alone.
 
+## TUI performance
+
+- Develop the Ratatui consumer against replayed, representative workloads, not
+  visual intuition alone. Treat retained Codex rollout traces and the longest
+  available Amp thread exports as the primary corpus. Codex traces provide
+  event ordering, streaming bursts, tool/reasoning interleaving, and timing;
+  Amp threads provide mature interactive transcript shapes, long messages, and
+  long-session behavior. Discover candidates with `amp threads list
+  --include-archived --json` and read selected payloads with `amp threads export
+  <thread-id>`.
+- Keep the retained trace corpus outside Git. Commit only deterministic derived
+  fixtures or structural workload summaries that are explicitly intended to be
+  source-controlled test data.
+- Give every TUI phase a measured baseline and an explicit regression gate for
+  the costs it changes: state-update throughput, frame construction and layout,
+  rendered frame count, changed-cell/output volume, allocations or retained
+  memory, input-to-frame latency, and resize behavior as applicable.
+- Use focused synthetic cases only to isolate a demonstrated cost or correctness
+  boundary. Validate claimed wins by replaying representative trace-derived
+  sessions at multiple terminal sizes, including streaming and long-history
+  tails.
+
 ## Current non-goals
 
 - No app server, JSON-RPC daemon, provider abstraction, approval subsystem,
@@ -145,9 +199,12 @@
 - Keep the promoted Ratatui, PyO3, and Node/browser WASM consumers as thin
   adapters over the owned session API; they must consume, not reshape, the
   library contract. Do not add browser/computer use, JJ review provenance,
-  graders, or local multi-agent scheduling until separately promoted.
-- Do not expose turn IDs, steering, or branching in the default prompt API
-  before those behaviors are implemented end to end.
+  graders, or a generic local multi-agent scheduler. Application-owned Code
+  Mode child tools and the Ratatui `/btw` fork remain thin consumers of the
+  owned session API rather than core scheduling concepts.
+- Do not expose raw transport response IDs or internal turn IDs. Branching may
+  be exposed through opaque checkpoints on completed typed turn results only
+  after the behavior is implemented end to end.
 
 ## Cursor Cloud specific instructions
 
@@ -155,11 +212,12 @@ These notes are for cloud agents booting into an environment where the startup
 update script has already refreshed dependencies. Standard commands live in the
 `Justfile` and `README.md`; only the non-obvious caveats are captured here.
 
-- Toolchain gotcha: the workspace is edition 2024 and pins `rust-version = "1.88"`,
+- Toolchain gotcha: the workspace is edition 2024 and pins `rust-version = "1.97"`,
   but the base image ships an older default (1.83). The update script installs
-  and sets `1.88.0` (with `clippy` + `rustfmt`) as the rustup default. If a
-  future base image is even older, `cargo` will refuse to build until a
-  1.88+ toolchain is the active default.
+  and sets `1.97.0` (with `clippy` + `rustfmt`) as the rustup default. If the
+  pinned `rust-version` in `Cargo.toml` is ever bumped again, update the startup
+  script to match, otherwise `cargo` refuses to build until a new-enough
+  toolchain is the active default.
 - `uv` and `just` are installed to `~/.local/bin`. Interactive shells get this on
   `PATH` via `~/.bashrc`, but non-interactive shells may not, so invoke them by
   full path (`~/.local/bin/just`, `~/.local/bin/uv`) or export the path first if a

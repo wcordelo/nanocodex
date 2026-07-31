@@ -1,10 +1,9 @@
 use std::{path::PathBuf, sync::Arc};
 
-use nanocodex_core::ToolDefinition;
+use nanocodex_oai_api::tools::ToolDefinition;
 use serde::Deserialize;
-use serde_json::{Value, json};
 
-use crate::{Tool, ToolContext, ToolExecution, ToolInput};
+use crate::{StandardTool, Tool, ToolContext, ToolInput, ToolOutput, ToolResult};
 
 use super::{ExecCommand, ShellSessions, WriteStdin};
 
@@ -14,7 +13,7 @@ pub(crate) struct ExecCommandHandler {
 }
 
 impl ExecCommandHandler {
-    pub(crate) fn new(workspace: PathBuf, sessions: Arc<ShellSessions>) -> Self {
+    pub(crate) const fn new(workspace: PathBuf, sessions: Arc<ShellSessions>) -> Self {
         Self {
             workspace,
             sessions,
@@ -24,55 +23,16 @@ impl ExecCommandHandler {
 
 #[async_trait::async_trait]
 impl Tool for ExecCommandHandler {
-    fn name(&self) -> &'static str {
-        "exec_command"
-    }
-
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition::function(
-            self.name(),
-            "Runs a shell command, returning output or a session ID for ongoing interaction. Live sessions are terminated when the agent ends; detach services that must remain running afterward.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "cmd": { "type": "string", "description": "Shell command to execute." },
-                    "workdir": {
-                        "type": "string",
-                        "description": "Working directory for the command. Defaults to the task workspace."
-                    },
-                    "shell": {
-                        "type": "string",
-                        "description": "Shell binary to launch. Defaults to the user's default shell."
-                    },
-                    "login": {
-                        "type": "boolean",
-                        "description": "True runs with login-shell semantics; false disables them. Defaults to true."
-                    },
-                    "tty": {
-                        "type": "boolean",
-                        "description": "True allocates a PTY for the command; false or omitted uses plain pipes."
-                    },
-                    "yield_time_ms": {
-                        "type": "integer",
-                        "description": "Wait before yielding output. Defaults to 10000 ms; effective range is 250-30000 ms."
-                    },
-                    "max_output_tokens": {
-                        "type": "integer",
-                        "description": "Output token budget. Defaults to 10000 tokens; larger requests may be capped by policy."
-                    }
-                },
-                "required": ["cmd"],
-                "additionalProperties": false
-            }),
-        )
-        .with_output_schema(unified_exec_output_schema())
+        StandardTool::ExecCommand.definition()
     }
 
-    async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolExecution {
-        let arguments = match input.decode_json::<ExecCommandArguments>() {
-            Ok(arguments) => arguments,
-            Err(error) => return ToolExecution::error(error.to_string()),
-        };
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+        let arguments = input.decode_json::<ExecCommandArguments>()?;
         let command = ExecCommand::new(
             arguments.cmd,
             arguments.workdir,
@@ -83,7 +43,7 @@ impl Tool for ExecCommandHandler {
             arguments.max_output_tokens,
         );
         let result = self.sessions.execute(command, &self.workspace).await;
-        ToolExecution::json(&result)
+        Ok(shell_execution(&result))
     }
 }
 
@@ -92,53 +52,23 @@ pub(crate) struct WriteStdinHandler {
 }
 
 impl WriteStdinHandler {
-    pub(crate) fn new(sessions: Arc<ShellSessions>) -> Self {
+    pub(crate) const fn new(sessions: Arc<ShellSessions>) -> Self {
         Self { sessions }
     }
 }
 
 #[async_trait::async_trait]
 impl Tool for WriteStdinHandler {
-    fn name(&self) -> &'static str {
-        "write_stdin"
-    }
-
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition::function(
-            self.name(),
-            "Writes characters to an existing exec session and returns recent output.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "session_id": {
-                        "type": "integer",
-                        "description": "Identifier of the running exec session."
-                    },
-                    "chars": {
-                        "type": "string",
-                        "description": "Bytes to write to stdin. Defaults to empty, which polls without writing."
-                    },
-                    "yield_time_ms": {
-                        "type": "integer",
-                        "description": "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms; empty polls wait 5000-300000 ms by default."
-                    },
-                    "max_output_tokens": {
-                        "type": "integer",
-                        "description": "Output token budget. Defaults to 10000 tokens; larger requests may be capped by policy."
-                    }
-                },
-                "required": ["session_id"],
-                "additionalProperties": false
-            }),
-        )
-        .with_output_schema(unified_exec_output_schema())
+        StandardTool::WriteStdin.definition()
     }
 
-    async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolExecution {
-        let arguments = match input.decode_json::<WriteStdinArguments>() {
-            Ok(arguments) => arguments,
-            Err(error) => return ToolExecution::error(error.to_string()),
-        };
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+        let arguments = input.decode_json::<WriteStdinArguments>()?;
         let request = WriteStdin::new(
             arguments.session_id,
             arguments.chars,
@@ -146,8 +76,21 @@ impl Tool for WriteStdinHandler {
             arguments.max_output_tokens,
         );
         let result = self.sessions.write_stdin(request).await;
-        ToolExecution::json(&result)
+        Ok(shell_execution(&result))
     }
+}
+
+fn shell_execution(result: &super::ExecCommandResult) -> ToolOutput {
+    if let Some(error) = &result.error {
+        return ToolOutput::error(error);
+    }
+    ToolOutput::json(&result).with_process_trace(
+        result.exit_code,
+        result.session_id,
+        result.original_token_count,
+        result.output.len(),
+        result.wall_time_seconds,
+    )
 }
 
 #[derive(Deserialize)]
@@ -163,55 +106,21 @@ struct ExecCommandArguments {
     #[serde(default)]
     tty: bool,
     #[serde(default)]
-    yield_time_ms: Option<i64>,
+    yield_time_ms: Option<u64>,
     #[serde(default)]
-    max_output_tokens: Option<i64>,
+    max_output_tokens: Option<usize>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WriteStdinArguments {
-    session_id: i64,
+    session_id: i32,
     #[serde(default)]
     chars: String,
     #[serde(default)]
-    yield_time_ms: Option<i64>,
+    yield_time_ms: Option<u64>,
     #[serde(default)]
-    max_output_tokens: Option<i64>,
-}
-
-fn unified_exec_output_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "chunk_id": {
-                "type": "string",
-                "description": "Chunk identifier included when the response reports one."
-            },
-            "wall_time_seconds": {
-                "type": "number",
-                "description": "Elapsed wall time spent waiting for output in seconds."
-            },
-            "exit_code": {
-                "type": "number",
-                "description": "Process exit code when the command finished during this call."
-            },
-            "session_id": {
-                "type": "number",
-                "description": "Session identifier to pass to write_stdin when the process is still running."
-            },
-            "original_token_count": {
-                "type": "number",
-                "description": "Approximate token count before output truncation."
-            },
-            "output": {
-                "type": "string",
-                "description": "Command output text, possibly truncated."
-            }
-        },
-        "required": ["wall_time_seconds", "output"],
-        "additionalProperties": false
-    })
+    max_output_tokens: Option<usize>,
 }
 
 #[cfg(test)]
@@ -222,7 +131,7 @@ mod tests {
     use crate::shell::ShellSessions;
 
     #[test]
-    fn exec_command_exposes_shell_parameter_and_session_lifecycle() {
+    fn exec_command_exposes_codex_description_and_shell_parameter() {
         let handler = ExecCommandHandler::new(PathBuf::from("/"), Arc::new(ShellSessions::new()));
         let spec = serde_json::to_value(handler.definition()).unwrap();
 
@@ -230,7 +139,7 @@ mod tests {
             spec.pointer("/description")
                 .and_then(serde_json::Value::as_str),
             Some(
-                "Runs a shell command, returning output or a session ID for ongoing interaction. Live sessions are terminated when the agent ends; detach services that must remain running afterward."
+                "Runs a command in a PTY, returning output or a session ID for ongoing interaction."
             )
         );
         assert_eq!(

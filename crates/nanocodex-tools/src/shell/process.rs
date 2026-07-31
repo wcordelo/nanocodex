@@ -14,7 +14,7 @@ use nix::{
     unistd::Pid,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 use tokio::task::JoinHandle;
 
 use super::selection::Shell;
@@ -54,34 +54,61 @@ pub(super) struct SpawnedProcess {
 }
 
 pub(super) enum ProcessChild {
-    Pipes(Child),
-    Pty(JoinHandle<io::Result<i32>>),
+    Pipes {
+        child: Child,
+        exit_code: Option<i32>,
+    },
+    Pty {
+        wait: Option<JoinHandle<io::Result<i32>>>,
+        exit_code: Option<i32>,
+    },
 }
 
 impl ProcessChild {
     pub(super) async fn wait(&mut self) -> io::Result<i32> {
         match self {
-            Self::Pipes(child) => child.wait().await.map(exit_code),
-            Self::Pty(wait) => wait
-                .await
-                .map_err(|error| io::Error::other(format!("PTY wait task failed: {error}")))?,
+            Self::Pipes {
+                child,
+                exit_code: cached,
+            } => {
+                if let Some(exit_code) = *cached {
+                    return Ok(exit_code);
+                }
+                let exit_code = child.wait().await.map(exit_code)?;
+                *cached = Some(exit_code);
+                Ok(exit_code)
+            }
+            Self::Pty {
+                wait,
+                exit_code: cached,
+            } => {
+                if let Some(exit_code) = *cached {
+                    return Ok(exit_code);
+                }
+                // Await by mutable reference so a yield timeout can cancel
+                // this wait without detaching and losing the sole join handle.
+                let result = wait
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("PTY wait result is unavailable"))?
+                    .await;
+                let exit_code = result.map_err(|error| {
+                    io::Error::other(format!("PTY wait task failed: {error}"))
+                })??;
+                *wait = None;
+                *cached = Some(exit_code);
+                Ok(exit_code)
+            }
         }
     }
 }
 
 pub(super) enum ProcessStdin {
-    Pipes(ChildStdin),
     Pty(Arc<StdMutex<Box<dyn Write + Send>>>),
 }
 
 impl ProcessStdin {
     pub(super) async fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
         match self {
-            Self::Pipes(stdin) => {
-                use tokio::io::AsyncWriteExt;
-                stdin.write_all(bytes).await?;
-                stdin.flush().await
-            }
             Self::Pty(writer) => {
                 let writer = Arc::clone(writer);
                 let bytes = bytes.to_vec();
@@ -135,7 +162,7 @@ fn spawn_pipes(
         .current_dir(workspace)
         .env_clear()
         .envs(environment.iter().cloned())
-        .stdin(Stdio::piped())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -147,12 +174,15 @@ fn spawn_pipes(
         .id()
         .ok_or_else(|| io::Error::other("spawned shell without a process identifier"))?;
     Ok(SpawnedProcess {
-        stdin: child.stdin.take().map(ProcessStdin::Pipes),
+        stdin: None,
         output: ProcessOutput::Pipes {
             stdout: child.stdout.take(),
             stderr: child.stderr.take(),
         },
-        child: ProcessChild::Pipes(child),
+        child: ProcessChild::Pipes {
+            child,
+            exit_code: None,
+        },
         process_group: ProcessGroupGuard::new(pid),
     })
 }
@@ -196,7 +226,10 @@ fn spawn_pty(
     });
 
     Ok(SpawnedProcess {
-        child: ProcessChild::Pty(wait),
+        child: ProcessChild::Pty {
+            wait: Some(wait),
+            exit_code: None,
+        },
         stdin: Some(ProcessStdin::Pty(Arc::new(StdMutex::new(writer)))),
         output: ProcessOutput::Pty(reader),
         process_group: ProcessGroupGuard::new(pid),
@@ -222,7 +255,7 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
     status.code().unwrap_or(1)
 }
 
-pub(super) struct ProcessGroupGuard {
+pub(crate) struct ProcessGroupGuard {
     #[cfg(unix)]
     process_group: Option<Pid>,
     #[cfg(not(unix))]
@@ -230,12 +263,28 @@ pub(super) struct ProcessGroupGuard {
 }
 
 impl ProcessGroupGuard {
-    fn new(pid: u32) -> Self {
+    pub(crate) fn new(pid: u32) -> Self {
         #[cfg(unix)]
         let process_group = i32::try_from(pid).ok().map(Pid::from_raw);
         #[cfg(not(unix))]
         let process_group = Some(pid);
         Self { process_group }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn interrupt(&self) -> io::Result<()> {
+        let Some(process_group) = self.process_group else {
+            return Err(io::Error::other("process identifier exceeds i32::MAX"));
+        };
+        match killpg(process_group, Signal::SIGINT) {
+            Ok(()) | Err(Errno::ESRCH) => Ok(()),
+            Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn interrupt(&self) -> io::Result<()> {
+        self.terminate()
     }
 
     #[cfg(unix)]
@@ -271,14 +320,14 @@ impl ProcessGroupGuard {
         Ok(())
     }
 
-    pub(super) fn disarm(&mut self) {
+    pub(super) const fn disarm(&mut self) {
         self.process_group = None;
     }
 
-    pub(super) fn terminate_and_disarm(&mut self) -> io::Result<()> {
-        let result = self.terminate();
+    pub(crate) fn terminate_and_disarm(&mut self) -> io::Result<()> {
+        self.terminate()?;
         self.disarm();
-        result
+        Ok(())
     }
 }
 
@@ -288,7 +337,9 @@ impl Drop for ProcessGroupGuard {
     }
 }
 
-pub(super) fn sanitized_environment() -> (Vec<(OsString, OsString)>, Vec<String>) {
+pub(super) fn sanitized_environment(
+    overrides: &[(OsString, OsString)],
+) -> (Vec<(OsString, OsString)>, Vec<String>) {
     let mut environment = Vec::new();
     let mut secrets = Vec::new();
     for (name, value) in env::vars_os() {
@@ -301,6 +352,15 @@ pub(super) fn sanitized_environment() -> (Vec<(OsString, OsString)>, Vec<String>
         }
     }
     normalize_environment(&mut environment);
+    for (name, value) in overrides {
+        environment.retain(|(candidate, _)| candidate != name);
+        environment.push((name.clone(), value.clone()));
+        if is_sensitive_name(name)
+            && let Some(value) = value.to_str().filter(|value| value.len() >= 8)
+        {
+            secrets.push(value.to_owned());
+        }
+    }
     secrets.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
     secrets.dedup();
     (environment, secrets)
@@ -311,6 +371,36 @@ fn normalize_environment(environment: &mut Vec<(OsString, OsString)>) {
         environment.retain(|(candidate, _)| candidate != name);
         environment.push((name.into(), value.into()));
     }
+}
+
+/// Returns the ambient environment variables the shell tool withholds from tool
+/// subprocesses because their names look sensitive.
+///
+/// Pass the result to
+/// [`ToolsBuilder::process_environment`](crate::ToolsBuilder::process_environment)
+/// when the embedder's tools legitimately need them. That is the case behind a
+/// credential-injecting proxy, where the variable holds a marker the proxy
+/// substitutes at the network boundary rather than a secret — a tool that cannot
+/// send the marker cannot authenticate at all, so withholding it only breaks the
+/// tool. Forwarded UTF-8 values of at least eight bytes still join the existing
+/// redaction list, so they stay masked in tool output.
+///
+/// Selecting by name is deliberate: forwarding the whole ambient environment
+/// would also override the shell normalization (`TERM`, `PAGER`, `NO_COLOR`, ...)
+/// that keeps tool output machine-readable.
+///
+/// # Security
+///
+/// This function selects variables by name and cannot distinguish proxy-safe
+/// markers from real secrets. Passing its result to a tool runtime grants every
+/// tool subprocess access to every returned value. Only use it when the embedding
+/// boundary deliberately permits that access.
+#[cfg(feature = "native")]
+#[must_use]
+pub fn ambient_sensitive_environment() -> Vec<(OsString, OsString)> {
+    env::vars_os()
+        .filter(|(name, _)| is_sensitive_name(name))
+        .collect()
 }
 
 fn is_sensitive_name(name: &OsStr) -> bool {
@@ -324,7 +414,42 @@ fn is_sensitive_name(name: &OsStr) -> bool {
 mod tests {
     use std::ffi::OsString;
 
-    use super::{NORMALIZED_ENVIRONMENT, normalize_environment};
+    #[cfg(feature = "native")]
+    use std::collections::BTreeSet;
+
+    #[cfg(feature = "native")]
+    use super::ambient_sensitive_environment;
+    use super::{NORMALIZED_ENVIRONMENT, normalize_environment, sanitized_environment};
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn ambient_sensitive_environment_partitions_the_ambient_environment() {
+        let forwarded: BTreeSet<_> = ambient_sensitive_environment()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        let (kept, _) = sanitized_environment(&[]);
+        let kept: BTreeSet<_> = kept.into_iter().map(|(name, _)| name).collect();
+
+        // The contract an embedder relies on: forwarding this set restores what
+        // the child lost and nothing else, so the two sets partition the ambient
+        // environment.
+        assert!(kept.is_disjoint(&forwarded));
+        for name in std::env::vars_os().map(|(name, _)| name) {
+            assert!(
+                kept.contains(&name) || forwarded.contains(&name),
+                "{name:?} is neither kept nor forwarded"
+            );
+        }
+        for name in &forwarded {
+            assert!(
+                !NORMALIZED_ENVIRONMENT
+                    .iter()
+                    .any(|(normalized, _)| name == normalized),
+                "{name:?} would override the shell normalization"
+            );
+        }
+    }
 
     #[test]
     fn normalized_environment_overrides_terminal_and_pager_values() {
@@ -347,5 +472,18 @@ mod tests {
                 vec![&OsString::from(value)]
             );
         }
+    }
+
+    #[test]
+    fn explicit_environment_overrides_are_retained_and_redacted() {
+        let value = OsString::from("proxy-secret-value");
+        let (environment, secrets) = sanitized_environment(&[
+            (OsString::from("TERM"), OsString::from("mpp-terminal")),
+            (OsString::from("NANOCODEX_PROXY_TOKEN"), value.clone()),
+        ]);
+
+        assert!(environment.contains(&(OsString::from("TERM"), OsString::from("mpp-terminal"))));
+        assert!(environment.contains(&(OsString::from("NANOCODEX_PROXY_TOKEN"), value,)));
+        assert!(secrets.iter().any(|secret| secret == "proxy-secret-value"));
     }
 }

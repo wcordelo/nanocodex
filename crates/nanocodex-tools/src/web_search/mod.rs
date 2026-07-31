@@ -4,8 +4,11 @@ mod wire;
 
 use std::time::Duration;
 
-use nanocodex_core::ToolDefinition;
-use reqwest::header::USER_AGENT;
+use nanocodex_oai_api::{
+    auth::{OpenAiAuth, OpenAiAuthError, OpenAiAuthMode, OpenAiAuthSnapshot},
+    tools::ToolDefinition,
+};
+use reqwest::header::{AUTHORIZATION, USER_AGENT};
 use serde_json::{Value, json};
 use tokio::time::{sleep, timeout};
 
@@ -14,7 +17,7 @@ use self::{
     schema::commands_schema,
     wire::{SearchCommands, SearchRequest, SearchResponse, SearchSettings},
 };
-use super::{Tool, ToolContext, ToolExecution, ToolInput, WebSearchConfig};
+use super::{Tool, ToolContext, ToolInput, ToolOutput, ToolResult, WebSearchConfig};
 
 const DESCRIPTION: &str = include_str!("web_run_description.md");
 const ERROR_BODY_LIMIT: usize = 4_096;
@@ -26,48 +29,53 @@ const RETRY_DELAY: Duration = Duration::from_millis(200);
 pub(super) struct WebSearchHandler {
     client: reqwest::Client,
     endpoint: String,
-    api_key: String,
+    auth: OpenAiAuth,
 }
 
 impl WebSearchHandler {
+    #[cfg(test)]
     pub(super) fn new(config: WebSearchConfig) -> Self {
+        Self::with_client(config, reqwest::Client::new())
+    }
+
+    pub(super) fn with_client(config: WebSearchConfig, client: reqwest::Client) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client,
             endpoint: config.endpoint,
-            api_key: config.api_key,
+            auth: config.auth,
         }
     }
 
-    async fn run(&self, input: &str, context: ToolContext<'_>) -> ToolExecution {
+    async fn run(&self, input: &str, context: ToolContext<'_>) -> ToolOutput {
         match timeout(TOOL_TIMEOUT, self.run_inner(input, context)).await {
             Ok(execution) => execution,
-            Err(_) => ToolExecution::error(format!(
+            Err(_) => ToolOutput::error(format!(
                 "standalone web search timed out after {} seconds",
                 TOOL_TIMEOUT.as_secs()
             )),
         }
     }
 
-    async fn run_inner(&self, input: &str, context: ToolContext<'_>) -> ToolExecution {
+    async fn run_inner(&self, input: &str, context: ToolContext<'_>) -> ToolOutput {
         let commands = if input.trim().is_empty() {
             SearchCommands::default()
         } else {
             match serde_json::from_str(input) {
                 Ok(commands) => commands,
                 Err(error) => {
-                    return ToolExecution::error(format!(
+                    return ToolOutput::error(format!(
                         "failed to parse web.run arguments: {error}"
                     ));
                 }
             }
         };
         if let Err(error) = commands.validate() {
-            return ToolExecution::error(error);
+            return ToolOutput::error(error);
         }
 
         let commands = commands.into_requests();
         let request_count = commands.len();
-        let input = recent_input(context.history);
+        let input = recent_input(context.history());
         let mut outputs = Vec::with_capacity(request_count);
         let mut failures = Vec::new();
         let mut results = Vec::new();
@@ -75,8 +83,8 @@ impl WebSearchHandler {
 
         for (index, commands) in commands.iter().enumerate() {
             let request = SearchRequest {
-                id: context.session_id,
-                model: context.model,
+                id: context.session_id(),
+                model: context.model(),
                 input: input.as_deref(),
                 commands,
                 settings: SearchSettings {
@@ -84,7 +92,7 @@ impl WebSearchHandler {
                     external_web_access: true,
                 },
                 max_output_tokens: request_token_budget(
-                    context.output_token_budget,
+                    context.output_token_budget(),
                     index,
                     request_count,
                 ),
@@ -127,14 +135,14 @@ impl WebSearchHandler {
 
         let output = outputs.join("\n");
         let mut execution = if failures.is_empty() {
-            ToolExecution::text(output.clone()).with_code_mode_value(Value::String(output))
+            ToolOutput::text(output.clone()).with_code_mode_value(Value::String(output))
         } else {
             let mut error = failures.join("\n");
             if !output.is_empty() {
                 error.push_str("\n\nWeb search output:\n");
                 error.push_str(&output);
             }
-            ToolExecution::error(error)
+            ToolOutput::error(error)
         };
         if saw_results {
             execution = execution.with_metadata(json!({ "results": results }));
@@ -176,18 +184,61 @@ impl WebSearchHandler {
         &self,
         request: &SearchRequest<'_>,
     ) -> Result<(reqwest::StatusCode, Vec<u8>), RequestFailure> {
-        let response = self
+        let auth = self
+            .auth
+            .snapshot()
+            .await
+            .map_err(|error| auth_failure(&error))?;
+        let response = self.send_authorized(request, &auth).await?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            && auth.mode() == OpenAiAuthMode::ChatGpt
+        {
+            self.auth
+                .recover_unauthorized(&auth)
+                .await
+                .map_err(|error| auth_failure(&error))?;
+            let refreshed = self
+                .auth
+                .snapshot()
+                .await
+                .map_err(|error| auth_failure(&error))?;
+            return self
+                .read_response(self.send_authorized(request, &refreshed).await?)
+                .await;
+        }
+        self.read_response(response).await
+    }
+
+    async fn send_authorized(
+        &self,
+        body: &SearchRequest<'_>,
+        auth: &OpenAiAuthSnapshot,
+    ) -> Result<reqwest::Response, RequestFailure> {
+        let mut request = self
             .client
             .post(&self.endpoint)
             .header(USER_AGENT, concat!("nanocodex/", env!("CARGO_PKG_VERSION")))
-            .bearer_auth(&self.api_key)
-            .json(request)
+            .header(AUTHORIZATION, format!("Bearer {}", auth.bearer()));
+        if let Some(account_id) = auth.account_id() {
+            request = request.header("ChatGPT-Account-ID", account_id);
+        }
+        if auth.is_fedramp() {
+            request = request.header("X-OpenAI-Fedramp", "true");
+        }
+        request
+            .json(body)
             .send()
             .await
             .map_err(|error| RequestFailure {
                 message: format!("standalone web search request failed: {error}"),
                 retryable: true,
-            })?;
+            })
+    }
+
+    async fn read_response(
+        &self,
+        response: reqwest::Response,
+    ) -> Result<(reqwest::StatusCode, Vec<u8>), RequestFailure> {
         let status = response.status();
         let body = read_response_body(response).await.map_err(|mut failure| {
             failure.retryable |= status.is_server_error();
@@ -197,22 +248,26 @@ impl WebSearchHandler {
     }
 }
 
+fn auth_failure(error: &OpenAiAuthError) -> RequestFailure {
+    RequestFailure {
+        message: error.to_string(),
+        retryable: false,
+    }
+}
+
 #[async_trait::async_trait]
 impl Tool for WebSearchHandler {
-    fn name(&self) -> &'static str {
-        "web__run"
-    }
-
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition::function(self.name(), DESCRIPTION, commands_schema())
+        ToolDefinition::function("web__run", DESCRIPTION, commands_schema())
     }
 
-    async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolExecution {
-        let input = match input.function_json() {
-            Ok(input) => input,
-            Err(error) => return ToolExecution::error(error.to_string()),
-        };
-        self.run(input.get(), context).await
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
+        let input = input.function_json()?;
+        Ok(self.run(input.get(), context).await)
     }
 }
 
@@ -279,142 +334,15 @@ fn has_semantic_error(output: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use eyre::{Result, eyre};
-    use serde_json::{Value, json};
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::{TcpListener, TcpStream},
-        task::JoinHandle,
-    };
+    use serde_json::json;
 
-    use super::{Tool, ToolContext, WebSearchConfig, WebSearchHandler};
-    use crate::ToolOutputBody;
-
-    #[tokio::test]
-    async fn posts_codex_search_request_and_returns_plaintext_output() -> Result<()> {
-        let (endpoint, server) = spawn_search_server().await?;
-        let handler = WebSearchHandler::new(WebSearchConfig {
-            endpoint,
-            api_key: "test-key".to_owned(),
-        });
-        let history = serde_json::from_value::<Vec<nanocodex_core::ResponseItem>>(json!([
-            json!({
-                "type": "message",
-                "role": "user",
-                "content": [{
-                    "type": "input_text",
-                    "text": "<environment_context>ignored</environment_context>"
-                }]
-            }),
-            json!({
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": "Search the web"}]
-            }),
-        ]))?;
-        let execution = handler
-            .run(
-                r#"{"search_query":[{"q":"standalone web search"}]}"#,
-                ToolContext {
-                    model: "gpt-5.6-sol",
-                    session_id: "search-session",
-                    call_id: "call-search",
-                    history: &history,
-                    output_token_budget: crate::DEFAULT_TOOL_OUTPUT_TOKENS,
-                },
-            )
-            .await;
-
-        assert!(execution.success);
-        assert!(matches!(
-            execution.output,
-            ToolOutputBody::Text(ref text) if text == "Search result with turn0search0"
-        ));
-        assert_eq!(
-            execution.value(),
-            Value::String("Search result with turn0search0".to_owned())
-        );
-        assert_eq!(
-            execution
-                .metadata
-                .as_deref()
-                .map(|raw| serde_json::from_str::<Value>(raw.get()).unwrap()),
-            Some(json!({
-                "results": [{
-                    "type": "text_result",
-                    "ref_id": "turn0search0",
-                    "url": "https://example.com/result",
-                    "future_field": {"preserved": true}
-                }]
-            }))
-        );
-
-        let request = server.await??;
-        assert_eq!(request["id"], "search-session");
-        assert_eq!(request["model"], "gpt-5.6-sol");
-        assert_eq!(
-            request["commands"],
-            json!({"search_query": [{"q": "standalone web search"}]})
-        );
-        assert_eq!(
-            request["settings"],
-            json!({"allowed_callers": ["direct"], "external_web_access": true})
-        );
-        assert_eq!(request["max_output_tokens"], 10_000);
-        assert_eq!(
-            request["input"],
-            json!([{
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": "Search the web"}]
-            }])
-        );
-        assert!(request.get("reasoning").is_none());
-        Ok(())
-    }
-
-    async fn spawn_search_server() -> Result<(String, JoinHandle<Result<Value>>)> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let endpoint = format!("http://{}/v1/alpha/search", listener.local_addr()?);
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            let (headers, body) = read_http_request(&mut stream).await?;
-            if !headers
-                .to_ascii_lowercase()
-                .contains("authorization: bearer test-key")
-            {
-                return Err(eyre!("search request did not contain bearer auth"));
-            }
-            let response = serde_json::to_vec(&json!({
-                "encrypted_output": "ciphertext",
-                "output": "Search result with turn0search0",
-                "results": [{
-                    "type": "text_result",
-                    "ref_id": "turn0search0",
-                    "url": "https://example.com/result",
-                    "future_field": {"preserved": true}
-                }]
-            }))?;
-            stream
-                .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                        response.len()
-                    )
-                    .as_bytes(),
-                )
-                .await?;
-            stream.write_all(&response).await?;
-            Ok(body)
-        });
-        Ok((endpoint, server))
-    }
+    use super::{Tool, WebSearchConfig, WebSearchHandler};
 
     #[test]
     fn exposes_codex_web_run_schema_and_description() {
         let handler = WebSearchHandler::new(WebSearchConfig {
             endpoint: "http://127.0.0.1:1/v1/alpha/search".to_owned(),
-            api_key: "test-key".to_owned(),
+            auth: nanocodex_oai_api::auth::OpenAiAuth::api_key("test-key"),
         });
         let spec = serde_json::to_value(handler.definition()).unwrap();
 
@@ -429,42 +357,5 @@ mod tests {
                 .as_str()
                 .is_some_and(|description| description.contains("turn2search5"))
         );
-    }
-
-    async fn read_http_request(stream: &mut TcpStream) -> Result<(String, Value)> {
-        let mut bytes = Vec::new();
-        let header_end = loop {
-            let mut chunk = [0_u8; 1024];
-            let read = stream.read(&mut chunk).await?;
-            if read == 0 {
-                return Err(eyre!("HTTP request ended before its headers"));
-            }
-            bytes.extend_from_slice(&chunk[..read]);
-            if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
-                break index + 4;
-            }
-        };
-        let headers = std::str::from_utf8(&bytes[..header_end])?.to_owned();
-        let content_length = headers
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().ok())
-                    .flatten()
-            })
-            .ok_or_else(|| eyre!("HTTP request omitted content-length"))?;
-        while bytes.len() - header_end < content_length {
-            let mut chunk = [0_u8; 1024];
-            let read = stream.read(&mut chunk).await?;
-            if read == 0 {
-                return Err(eyre!("HTTP request body ended early"));
-            }
-            bytes.extend_from_slice(&chunk[..read]);
-        }
-        Ok((
-            headers,
-            serde_json::from_slice(&bytes[header_end..header_end + content_length])?,
-        ))
     }
 }

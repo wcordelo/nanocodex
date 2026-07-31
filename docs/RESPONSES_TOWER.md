@@ -1,45 +1,67 @@
-# Responses WebSocket and Tower architecture
+# Responses transports and Tower architecture
 
 Status: implemented.
 
 ## Ownership and public composition
 
-`Nanocodex::new(api_key)` starts the standard fixed-model agent. The builder
-exposes the system prompt, thinking level, tools, workspace, stable session ID,
-and Responses service while keeping driver mechanics private.
+`OpenAi::new(auth)` creates the standard fixed-model client recipe.
+`OpenAi::builder(auth)` exposes transport, storage, history, reasoning, and
+Tower policy. `Nanocodex::builder(openai)` then adds agent instructions, tools,
+workspace, session identity, and lifecycle policy while keeping driver
+mechanics private.
 
 `build()` requires an active Tokio runtime, spawns one stateful driver, and
 returns `(Nanocodex, AgentEvents)`. The driver owns mutable conversation,
 model, tool-runtime, and Tower service state. Each accepted prompt returns a
 `Turn`; `turn.result()` is independent from the optional event stream.
 
-One driver reuses its WebSocket, server response chain, typed history,
-code-mode runtime, shell sessions, and prompt-cache identity across follow-on
-turns. The caller does not replay earlier results.
+One driver reuses its selected transport policy, server response chain, typed
+history, code-mode runtime, shell sessions, and prompt-cache identity across
+follow-on turns. A WebSocket policy also reuses its connection. The caller does
+not replay earlier results.
 
-`ResponsesClient<S>` is generic over `Service<ResponsesAttempt>`. The common
-builder defers caller layers until it constructs the configured standard
-service:
+The standard policy is WebSocket plus incremental history and `store: false`
+for both API-key and ChatGPT subscription authentication. API-key callers can
+opt into durable provider checkpoints with `.store(true)`; ChatGPT
+subscription authentication cannot. Selecting HTTPS with storage disabled
+automatically selects full replay. WebSocket is the interactive default because
+its reused connection has the lowest measured warm first-event latency. Native
+callers can select HTTPS when cold start or fresh-fork startup matters more,
+but a session and every fork retain the one policy selected at build time. See
+[`RESPONSE_TRANSPORT_BENCH.md`](RESPONSE_TRANSPORT_BENCH.md) for the measured
+tradeoffs.
+
+`ResponsesClient<S>` is generic over `Service<ResponsesAttempt>`. The
+`OpenAi` builder applies caller layers when each independent session service is
+constructed:
 
 ```rust,ignore
 use std::time::Duration;
 
-use nanocodex::{Nanocodex, Responses};
+use nanocodex::{Nanocodex, OpenAi};
 use tower::{limit::ConcurrencyLimitLayer, timeout::TimeoutLayer};
 
-let responses = Responses::builder()
+let openai = OpenAi::builder(std::env::var("OPENAI_API_KEY")?)
     .layer(TimeoutLayer::new(Duration::from_secs(180)))
     .layer(ConcurrencyLimitLayer::new(1))
-    .build();
+    .build()?;
 
-let (agent, events) = Nanocodex::builder(api_key)
-    .responses(responses)
+let (agent, events) = Nanocodex::builder(openai)
+    .instructions(
+        "You are a Rust coding agent. Preserve unrelated work and run relevant tests.",
+    )
     .build()?;
 ```
 
-`Responses::builder().service(stack)` replaces the standard stack with a fully
-caller-composed service. Neither path requires boxing, a process server, JSONL,
-or a global client.
+`OpenAiBuilder::service` replaces the standard stack with a factory for a fully
+caller-composed service. Its API documentation contains the complete compiling
+`tower::service_fn` adapter shape. Every root, cancellation replacement, child,
+and fork receives independent mutable service state. Neither path requires
+boxing, a process server, JSONL, or a global client.
+
+Reasoning and fast-mode values configured on `OpenAiBuilder` become defaults
+for the agent recipe. Calling the corresponding `NanocodexBuilder` method later
+overrides that value for the owned agent.
 
 ## Tower operation boundary
 
@@ -57,21 +79,22 @@ retry, metrics, tracing, and error-mapping layers. Returning success after only
 sending a frame would make those policies incorrect.
 
 `ResponsesAttempt` is an owned replay snapshot. Large history is shared by
-`Arc`; cloning an attempt does not deep-clone the conversation. A healthy socket
-sends only the new delta with `previous_response_id`. A replacement socket
-invalidates that connection-local ID and serializes the full committed history.
+`Arc`; cloning an attempt does not deep-clone the conversation. Incremental
+history sends only the new delta with `previous_response_id`. Full-replay
+history serializes the complete committed conversation. A replacement
+ephemeral socket invalidates its connection-local ID and also replays history.
 
 Only completed responses enter history. Failed partial output cannot execute a
 tool or be replayed, so retry cannot duplicate a partial side effect.
 
 ## Standard resilience
 
-The default stack is one typed retry owner around one persistent socket:
+The default stack is one typed retry owner around one configured transport:
 
 ```text
 ResponsesRetryPolicy
   -> ResponsesService
-       -> ResponsesSocket
+       -> ResponsesSocket | HTTPS/SSE request
 ```
 
 Generation and compaction receive at most five attempts. Transient connection,
@@ -81,9 +104,10 @@ policy, quota, usage-limit, and context failures remain terminal. Server delay
 hints override bounded exponential backoff.
 
 Reconnect preserves the stable prompt-cache key and client-owned history,
-drops `previous_response_id`, and forces full-history replay. Requests retain
-`store: false`; prompt caching is an optimization, not the history source of
-truth.
+drops a connection-local `previous_response_id`, and forces full-history
+replay. HTTPS with `store: false` always replays because it has no
+connection-local checkpoint. Prompt caching is an optimization, not the
+history source of truth.
 
 ## Caller middleware
 
@@ -139,11 +163,15 @@ because neither won the complete immutable-input request path.
 Run the portable benchmarks with:
 
 ```sh
-cargo bench -p nanocodex-service --bench tower_responses
+cargo bench -p nanocodex-oai-api --bench tower_responses
 ```
 
 Add `NANOCODEX_BENCH_EVENTS=/path/to/events.jsonl` to include a retained JSONL
 trace without checking private runtime data into the repository.
+
+The live [transport and storage benchmark](RESPONSE_TRANSPORT_BENCH.md) compares
+WebSocket and HTTPS/SSE, stored checkpoints and `store: false`, full history
+replay, and concurrent historical forks.
 
 ## Invariants
 
@@ -154,5 +182,5 @@ trace without checking private runtime data into the repository.
   turns.
 - Follow-on prompts reuse one socket and send only their new delta.
 - Exactly one terminal event is emitted for every accepted prompt.
-- Standard and caller-composed service paths use the same owned driver and
+- Standard and caller-composed service factories use the same owned driver and
   typed event contract.

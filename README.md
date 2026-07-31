@@ -1,422 +1,301 @@
-# Nanocodex
+<div align="center">
 
-Nanocodex is a small, headless Rust agents SDK. It is a library first: embed it
-in your process, configure the agent and its tools, submit turns through a cheap
-handle, and decide whether to consume every event or only typed final results.
-There is no required app server, JSON-RPC layer, global runtime, or UI. The CLI
-and Harbor integration in this repository are thin adapters over the same
-public library API.
+<h1>Nanocodex</h1>
 
-The scope is deliberately narrow. Nanocodex currently runs `gpt-5.6-sol` over
-the OpenAI Responses WebSocket API, preserves one stateful session across
-follow-on prompts, and exposes its transport as a caller-composable Tower
-service. Model-generated code mode runs in local Node.js and calls the Rust tool
-registry.
+<p><strong>Building blocks for frontier OpenAI agents.</strong></p>
 
-## Use the daily-driver CLI
+[![CI](https://img.shields.io/github/actions/workflow/status/gakonst/nanocodex/ci.yml?branch=master)][ci]
+[![Crates.io](https://img.shields.io/crates/v/nanocodex.svg)][crates]
+[![Docs.rs](https://img.shields.io/docsrs/nanocodex)][docs]
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)][license]
 
-Install the repository binary and launch it from the workspace you want the
-agent to edit:
+**[Install](#install)** · **[Agent API](#minimal-api-example)** ·
+**[Thesis](#thesis)** · **[Components](#components)** ·
+**[VM-backed tools](#vm-backed-tools)** · **[Documentation](#documentation)**
 
-```sh
-cargo install --path bin/nanocodex
-export OPENAI_API_KEY=...
-nanocodex
-```
+[ci]: https://github.com/gakonst/nanocodex/actions/workflows/ci.yml
+[crates]: https://crates.io/crates/nanocodex
+[docs]: https://docs.rs/nanocodex
+[license]: LICENSE-MIT
 
-The Ratatui interface keeps one agent and WebSocket alive across follow-on
-prompts, streams assistant output, shows tool activity, accepts prompts while a
-turn is running, and retains prompt history and scrollback for the session.
-Press Enter to submit, Ctrl+J or Shift+Enter for a newline, Up/Down for prompt
-history, PageUp/PageDown or the mouse wheel to scroll, Esc to clear the
-composer, and Ctrl+C to exit. Use `--cwd`, `--thinking`, `--system-prompt`,
-`--web-search`, and `--image-generation` to configure the session; `--prompt`
-submits an initial turn immediately.
+</div>
 
-The headless adapter remains available for scripts and evals. Its stdout is
-flushed JSONL only:
+## Install
+
+Install the Nanocodex CLI on macOS or Linux:
 
 ```sh
-nanocodex run "Inspect this repository and summarize it."
+curl -fsSL https://nanocodex.paradigm.xyz | bash
 ```
 
-The CLI accepts the same MCP providers as the library. For example, a local
-stdio server can be exercised across repeated turns on one retained session:
+Or add the Rust SDK to an application:
 
 ```sh
-nanocodex \
-  --mcp-stdio workspace=node \
-  --mcp-arg workspace=./server.mjs \
-  run --repeat 3 "Search the workspace tools and summarize the result."
+cargo add nanocodex
 ```
 
-Lifecycle tracing is written to stderr for headless runs and to
-`.nanocodex/logs/tui.log` for the TUI. `--log-format json` selects structured
-local logs, `RUST_LOG` or `--log-filter` controls filtering, and
-`--otel-endpoint http://localhost:4318` exports spans over OTLP/HTTP.
-
-## Use it as a library
-
-Until the crates are published, depend on the repository directly:
-
-```toml
-[dependencies]
-nanocodex = { git = "https://github.com/gakonst/nanocodex" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-```
-
-The smallest useful program submits one prompt and awaits its typed result. If
-you do not need live events, destructure them as `_`; the receiver is dropped
-immediately and event production becomes a no-op:
-
-```rust
-use nanocodex::Nanocodex;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let api_key = std::env::var("OPENAI_API_KEY")?;
-    let (agent, _) = Nanocodex::new(api_key)?;
-
-    let turn = agent.prompt("Inspect this repository and summarize it.").await?;
-    let result = turn.result().await?;
-    println!("{}", result.final_message);
-    Ok(())
-}
-```
-
-`Nanocodex::new` uses the standard prompt, medium thinking, built-in tools,
-persistent WebSocket, and retry/reconnect policy. Node.js 12.22 or newer must be
-available on `PATH` for model-generated code mode.
-
-### Follow-on prompts and events
-
-`build()` spawns the stateful agent driver and returns `(Nanocodex,
-AgentEvents)`. `Nanocodex` is a cheap, cloneable command handle. Calling
-`prompt(...)` accepts and queues a turn, then immediately returns a `Turn`; the
-agent continues independently until `turn.result()` is awaited.
-
-The session retains the complete typed conversation history. A follow-on prompt
-does **not** need the previous `final_message`, transcript, response ID, or tool
-results passed back into it. On a healthy socket Nanocodex continues with
-`previous_response_id`; after a reconnect it transparently replays its retained
-history.
-
-```rust
-use nanocodex::{AgentEventKind, Nanocodex};
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let api_key = std::env::var("OPENAI_API_KEY")?;
-    let (agent, mut events) = Nanocodex::new(api_key)?;
-
-    tokio::spawn(async move {
-        while let Some(event) = events.recv().await {
-            if event.kind == AgentEventKind::AssistantMessage {
-                eprintln!("assistant message emitted");
-            }
-        }
-    });
-
-    let first = agent.prompt("Choose one word for this project.").await?;
-    // The caller can do unrelated work while the turn runs.
-    let first = first.result().await?;
-    println!("first: {}", first.final_message);
-
-    // No first.final_message is passed here. The agent has the first turn.
-    let second = agent
-        .prompt("Return the word you chose, but in uppercase.")
-        .await?;
-    println!("second: {}", second.result().await?.final_message);
-    Ok(())
-}
-```
-
-`AgentEvents` is the single ordered event stream for the session and is
-independent from turn results. A server, TUI, notebook, or language binding can
-translate all events, select a subset, or ignore them without changing prompt
-and result handling.
-
-### Define custom tools
-
-The `#[tool]` macro turns a normal async Rust function into a typed tool. It
-derives the JSON Schema from the function arguments, decodes calls, awaits the
-function, and returns the serialized result through the heterogeneous tool
-registry:
-
-```rust
-use nanocodex::{Nanocodex, Tools, tool};
-
-#[tool(description = "Multiplies two signed integers.")]
-async fn multiply(left: i64, right: i64) -> Result<i64, &'static str> {
-    left.checked_mul(right).ok_or("integer overflow")
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let api_key = std::env::var("OPENAI_API_KEY")?;
-    let tools = Tools::builder().tool(multiply).build()?;
-    let (agent, _) = Nanocodex::builder(api_key).tools(tools).build()?;
-
-    let result = agent
-        .prompt("Use the multiply tool to calculate 6 × 7, then return it.")
-        .await?
-        .result()
-        .await?;
-    println!("{}", result.final_message);
-    Ok(())
-}
-```
-
-`Tools::builder()` starts with the standard optional web-search and
-image-generation integrations enabled. Use `.without_defaults()` to disable
-those optional integrations before adding application tools. The core local
-coding tools remain available through code mode.
-
-For dynamic state, freeform inputs, multimodal outputs, metadata, or custom
-decoding, implement the public `Tool` trait directly and register the value with
-the same `.tool(...)` method. Internal and external tools use the same
-heterogeneous registry. See
-[`custom_tool.rs`](examples/custom_tool.rs) for a runnable
-example.
-
-Runnable examples live in the top-level [`examples`](examples) package:
+Switch the installed CLI between builds:
 
 ```sh
-cargo run -p nanocodex-examples --bin minimal
-cargo run -p nanocodex-examples --bin follow-on
-cargo run -p nanocodex-examples --bin custom-tool
-cargo run -p nanocodex-examples --bin subagents
-cargo run -p nanocodex-examples --bin mcp
+nanocodex update                 # latest stable release
+nanocodex update 0.2.0           # exact release, including downgrades
+nanocodex update --nightly       # latest nightly
+nanocodex update --pr 50         # verified on-demand PR artifact
+nanocodex update --path ./nanocodex  # trusted local binary
 ```
 
-### Add deferred MCP tools
+Downloaded builds are retained under `~/.nanocodex/versions`. Running
+`nanocodex update 0.2.0` again switches to the cached binary without another
+download. A stable launcher keeps `nanocodex update` available even while an
+older binary is active, and `~/.nanocodex/current` points to the selected
+version.
 
-`nanocodex-mcp` implements Streamable HTTP and stdio MCP clients as a dynamic
-Code Mode tool provider. Each configured server initializes and runs
-`tools/list` concurrently when the owned agent starts. Only the compact
-`tool_search` definition is in the initial model prompt; matching tools are
-activated on demand and can be called immediately from the same code cell.
+PR artifacts require an authenticated `gh` CLI and an already completed
+on-demand artifact workflow for that PR.
 
-```rust
-use nanocodex::{Mcp, McpServer, Nanocodex, Tools};
+## Minimal API Example
 
-# async fn example(api_key: String) -> Result<(), Box<dyn std::error::Error>> {
-let mcp = Mcp::builder()
-    .server(
-        "workspace",
-        McpServer::http("https://mcp.example.com/mcp")
-            .bearer_token_env("WORKSPACE_MCP_TOKEN"),
+```rust,ignore
+use nanocodex::{Nanocodex, OpenAi};
+
+let openai = OpenAi::new(std::env::var("OPENAI_API_KEY")?)?;
+let (agent, mut events) = Nanocodex::builder(openai)
+    .instructions(
+        "You are a Rust coding agent. Make focused changes, preserve unrelated work, \
+         and run relevant tests before finishing.",
     )
-    .server(
-        "local",
-        McpServer::stdio("node").args(["./server.mjs"]),
-    )
+    .workspace(std::env::current_dir()?)
     .build()?;
-let tools = Tools::builder().provider(mcp).build()?;
-let (agent, _) = Nanocodex::builder(api_key).tools(tools).build()?;
 
+let event_task = tokio::spawn(async move {
+    while let Some(event) = events.recv().await {
+        eprintln!("event {}: {:?}", event.seq, event.kind);
+        if event.kind.is_terminal() {
+            break;
+        }
+    }
+});
+
+// Alternative: stream this turn's response as it arrives:
+// use futures_util::StreamExt;
+// use nanocodex::agent::events::{AgentEventData, AssistantEvent};
+// let mut turn = agent.prompt("Find and fix the failing parser test.").await?;
+// while let Some(event) = turn.next().await {
+//     if let AgentEventData::Assistant(AssistantEvent::Delta(delta)) = event.data()? {
+//         print!("{}", delta.text);
+//     }
+// }
 let result = agent
-    .prompt("Search the configured MCP tools, use the relevant read-only tool, and summarize.")
+    .prompt("Find and fix the failing parser test.")
     .await?
-    .result()
     .await?;
-println!("{}", result.final_message);
-# Ok(())
-# }
+
+event_task.await?;
+println!("{}", result.final_message());
 ```
 
-HTTP authentication can come from a bearer token or arbitrary fixed/environment
-headers; secret values are resolved only by the background connection task.
-Server/tool filters and startup/tool timeouts are configured per `McpServer`.
-See [`mcp.rs`](examples/mcp.rs) for a runnable example.
+The first `await` accepts and orders the prompt. The second waits for its typed
+`TurnResult`. Follow-on prompts automatically reuse the agent's retained
+history, WebSocket, tools, shell sessions, and prompt-cache identity.
+`agent.clone()` is a cheap handle to that same session; the independently
+returned `AgentEvents` stream is the session-wide event firehose.
 
-### Add tracing and OpenTelemetry
+## Voice: devices or Unix pipes
 
-Nanocodex libraries emit stable `tracing` spans for sessions, turns, model
-calls, Responses attempts and connections, retries, tools, and MCP activity.
-They never install a global subscriber, so an embedding application can use
-its existing formatting, metrics, or OpenTelemetry stack. Contractual
-`AgentEvents` remain separate from diagnostic tracing.
-
-The optional `nanocodex-observability` crate provides the same compact stderr,
-JSON/file, and OTLP/HTTP setup used by the CLI:
-
-```toml
-[dependencies]
-nanocodex-observability = { git = "https://github.com/gakonst/nanocodex" }
-```
-
-```rust
-use nanocodex_observability::{LogFormat, ObservabilityBuilder};
-
-# fn install() -> Result<(), Box<dyn std::error::Error>> {
-let _guard = ObservabilityBuilder::new("my-agent", env!("CARGO_PKG_VERSION"))
-    .filter("warn,nanocodex=info,nanocodex_service=info,nanocodex_mcp=info")
-    .format(LogFormat::Json)
-    .otlp_endpoint("http://localhost:4318")
-    .install()?;
-# Ok(())
-# }
-```
-
-Keep the returned guard alive for the application lifetime so non-blocking
-formatting and batched trace export are flushed during shutdown. Spans include
-IDs, attempt/replay state, durations, status, token usage, and cache usage, but
-not API keys or full prompt bodies.
-
-### Embed from Python, Node.js, or a browser Worker
-
-The language bindings preserve the same owned session rather than wrapping the
-CLI or starting an app server:
-
-```python
-from nanocodex import Nanocodex
-
-agent, events = Nanocodex(api_key, thinking="low")
-first = agent.prompt("Choose one word for this project.")
-print(first.result())
-second = agent.prompt("Return that word in uppercase.")
-print(second.result())  # no previous result or transcript is passed back
-```
-
-The PyO3 extension owns a native Tokio runtime and exposes `Nanocodex`, `Turn`,
-and the ordered event receiver directly. See
-[`bindings/python`](bindings/python) for build instructions and the top-level
-[`examples/python`](examples/python) programs.
-
-Node.js and web consumers use one shared Rust/WASM artifact. Node supplies a
-header-capable WebSocket and can define async JavaScript tools; a browser Worker
-supplies its own authenticated WebSocket boundary and browser-native tools:
-
-```js
-const turn = agent.prompt("Use multiply to calculate 6 × 7.");
-console.log(await turn.result());
-const followOn = agent.prompt("Add one to that result.");
-console.log(await followOn.result());
-```
-
-See the top-level [`examples/node`](examples/node) and
-[`examples/react-vite`](examples/react-vite) consumers. The React example runs
-the persistent Rust/WASM agent in a real module Worker, displays the ordered
-event stream, and registers a browser-native custom tool. Browser WebSockets
-cannot set the Responses authorization upgrade header, so Nanocodex does not
-pretend direct browser authentication works and does not ship a relay; the
-embedding application supplies an already-authorized endpoint or custom
-`createWebSocket` implementation.
-
-[`subagents.rs`](examples/subagents.rs) shows that delegation does not require a
-multi-agent subsystem in the library. Its application-defined `spawn_agent`
-tool builds an independent `Nanocodex` for each task; the parent can invoke
-several of them concurrently from code mode with `Promise.all`. The example
-keeps delegation one level deep by leaving `spawn_agent` out of each child's
-tool registry. It also routes every parent and child `AgentEvent` through one
-host-owned writer, producing a unified JSONL stream with a global `stream_seq`
-and a tagged `source` while retaining each event's session-local `request_id`
-and `seq`.
-
-### Configure the agent and Tower stack
-
-`Nanocodex::builder(api_key)` exposes deliberate overrides for the system
-prompt, thinking level, tools, workspace, stable session ID, and Responses
-stack. `.prompt(...)` on the builder replaces the system/developer prompt;
-`.prompt(...)` on the built handle submits a user turn.
-
-Add `tower = { version = "0.5", features = ["limit", "timeout"] }` when
-composing the middleware used below.
-
-```rust
-use std::time::Duration;
-
-use nanocodex::{AgentEvents, Nanocodex, Responses, Thinking};
-use tower::{limit::ConcurrencyLimitLayer, timeout::TimeoutLayer};
-
-fn build_agent(api_key: String) -> nanocodex::Result<(Nanocodex, AgentEvents)> {
-    let responses = Responses::builder()
-        .layer(TimeoutLayer::new(Duration::from_secs(120)))
-        .layer(ConcurrencyLimitLayer::new(1))
-        .build();
-
-    Nanocodex::builder(api_key)
-        .prompt("You are a concise repository maintenance agent.")
-        .thinking(Thinking::Medium)
-        .workspace("/work/project")
-        .responses(responses)
-        .build()
-}
-```
-
-Tower layers are deferred until the standard persistent-WebSocket service is
-created. Callers can add deadlines, concurrency limits, load shedding, tracing,
-metrics, circuit breaking, or error mapping without boxing the client or
-rebuilding agent orchestration. `Responses::builder().service(stack)` replaces
-the standard service with any caller-composed
-`tower::Service<ResponsesAttempt>`.
-
-See [`docs/RESPONSES_TOWER.md`](docs/RESPONSES_TOWER.md) for the implemented
-operation boundary, layer ordering, retry safety, and benchmark evidence.
-
-### Crate boundaries
-
-The workspace exposes five independently useful library layers, following the
-same boundary style as `alloy-core` and Alloy's ergonomic top-level crate:
-
-- `nanocodex-core`: dependency-light prompts, events, model configuration, and
-  complete typed Responses wire/domain types.
-- `nanocodex-service`: persistent WebSocket transport, stream processing,
-  typed errors, Tower service/client, retry middleware, and telemetry.
-- `nanocodex-tools`: built-in tools, code mode, heterogeneous tool registry,
-  and the public tool trait.
-- `nanocodex-mcp`: background MCP transports, discovery catalog, BM25
-  `tool_search`, authentication inputs, and deferred Code Mode dispatch.
-- `nanocodex`: owned agent lifecycle, builders, and ergonomic re-exports.
-
-`nanocodex-macros` implements `#[tool]`. The `nanocodex-bin` package under
-`bin/nanocodex` is an example CLI adapter, not the SDK boundary.
-The PyO3 and Rust/WASM packages under `bindings/` are likewise thin embedded
-adapters over the owned session and typed event contract.
-
-## Develop this repository
+The non-TUI desktop example owns the default microphone and speaker directly
+in Rust, using the same `VoiceSessionBuilder` as the production TUI:
 
 ```sh
-just bootstrap      # install pinned host dependencies once
-just run            # native low-effort smoke; requires local Node.js
-just prepare-evals  # build/cache tasks and the shared verifier toolbox
-just eval           # fresh full model-driven Terminal-Bench suite
-just eval-hosted    # same pinned suite in hosted Daytona sandboxes
-just view           # inspect retained Harbor jobs
+nanocodex auth login # once; shares ~/.codex/auth.json with Codex
+cargo run -p nanocodex-examples --bin voice
 ```
 
-The native CLI defaults to the interactive Ratatui client. Its `run` subcommand
-accepts one positional prompt and streams flushed JSONL to stdout for Harbor and
-other process integrations. Neither adapter is required by the library.
+The lower adapter leaves device and media ownership outside Nanocodex. It reads
+24 kHz mono PCM16 little-endian audio from stdin, writes the same format to
+stdout, and keeps transcripts and agent events on stderr:
 
-Harbor builds a static Linux binary, installs it in an unchanged task container,
-and derives ATIF from the retained JSONL. Python owns upload/process lifecycle
-only; model decisions, API calls, tools, and mutations remain in Rust.
+```sh
+cargo run -p nanocodex-examples --bin realtime-pipe < microphone.pcm > speaker.pcm
+
+# Equivalently, compose any live capture/decoder and playback/encoder:
+capture-s16le | cargo run --quiet -p nanocodex-examples --bin realtime-pipe | play-s16le
+```
+
+Both retain one coding-agent session. A spoken request starts work while idle;
+a follow-up received during that work atomically steers the active turn at its
+next safe model boundary. Both use shared Codex/ChatGPT subscription auth, not
+an API key. Set `NANOCODEX_AUTH_FILE` to override the normal Codex credential
+path.
+
+## Thesis
+
+### Small, excellent building blocks
+
+Agent infrastructure is easier to understand and reuse when each piece has a
+sharp owner and a useful API of its own. An OpenAI client should work without
+an agent loop. Tools should work without a CLI. The high-level agent should
+compose those pieces rather than hide another implementation of them.
+
+Nanocodex makes a small number of deliberate choices—Rust, Tower, typed
+protocols, owned lifecycle state, and builder APIs—then keeps the boundaries
+boring.
+
+### The model and harness are co-designed
+
+We do not try to outsmart behavior that frontier models and Codex already make
+explicit. Context management, `AGENTS.md`, compaction, cache identity, tool
+shapes, continuation, reconnect replay, cancellation, and process cleanup are
+parts of the model-facing contract.
+
+Nanocodex carries those invariants into a smaller, library-first API while
+leaving application policy with the caller.
+
+### Evidence over intuition
+
+Representative `cargo bench` workloads, OpenTelemetry traces, differential
+tests, and end-to-end evals keep the harness honest. The goal is simple: normal
+agent turns should be model- and network-latency bound, with token usage and
+estimated USD cost visible at the same typed boundary as the result.
+
+## Components
 
 ```text
-native BuildKit compile -> static Linux binary
-                       -> Harbor task container
-                       -> /installed-agent/nanocodex
-                       -> Rust executes tools in /app
-                       -> Harbor verifier
+nanocodex                         Alloy-style facade and prelude
+├── agent                         nanocodex-agent
+│   ├── oai                       nanocodex-oai-api
+│   └── tools                     nanocodex-tools
+│       └── macros                nanocodex-tools-macros
+├── oai                           nanocodex-oai-api
+├── tools                         nanocodex-tools
+└── observability                 nanocodex-observability (optional)
 ```
 
-Local artifacts use Cargo's `dev` profile. Set
-`NANOCODEX_BUILD_PROFILE=profiling` for an optimized build with debug symbols.
-The pinned eval selection lives in
-[`evals/terminal-bench-2.yaml`](evals/terminal-bench-2.yaml), not the Justfile.
+The facade provides the canonical common imports. Each lower crate is also
+designed to be useful directly, without importing the higher orchestration
+layer.
 
-Hosted evals use Harbor's Daytona environment and a separate AMD64 artifact:
+### `nanocodex`
+
+The thin facade reexports the golden agent path at the crate root and keeps
+detailed APIs under `nanocodex::agent`, `nanocodex::oai`, and
+`nanocodex::tools`. Its prelude contains only the common types needed to build
+an agent.
+
+[Facade guide](crates/nanocodex/README.md) ·
+[API documentation](https://docs.rs/nanocodex)
+
+### `nanocodex-agent`
+
+The batteries-included lifecycle: an owned private driver, a cheap cloneable
+`Nanocodex` handle, typed `Turn` and `TurnResult` values, and an optional event
+stream. It owns prompt ordering, the tool loop, `AGENTS.md` discovery,
+compaction timing, cancellation, snapshots, and branching through `spawn`,
+`fork`, and `fork_from`.
+
+Callers never pass previous messages, response IDs, or tool results back into
+the agent.
+
+[Agent guide](crates/nanocodex-agent/README.md) ·
+[API documentation](https://docs.rs/nanocodex-agent)
+
+### `nanocodex-oai-api`
+
+The complete OpenAI boundary: API-key and ChatGPT authentication, typed
+Responses protocol values, a persistent WebSocket transport, client-owned
+context, continuation and replay, automatic pricing, and a generic Tower
+client.
+
+Its standalone `OpenAi -> Session -> ResponseTurn -> Response` path provides a
+managed conversation without taking on agent policy. Custom Tower layers and
+services remain concrete and nameable—no boxing or global client is required.
+
+[OpenAI API guide](crates/nanocodex-oai-api/README.md) ·
+[API documentation](https://docs.rs/nanocodex-oai-api)
+
+### `nanocodex-tools`
+
+The model-facing tool runtime: the `Tool` contract, heterogeneous `Tools`
+registry, standard workspace tools, shell and process lifecycle, Code Mode,
+deferred `tool_search`, remote dispatch, and MCP. MCP is always available on
+native targets.
+
+Applications can implement `Tool` directly or use the reexported `#[tool]`
+macro. The separate `nanocodex-tools-macros` package exists only for Rust's
+procedural-macro boundary.
+
+[Tools guide](crates/nanocodex-tools/README.md) ·
+[API documentation](https://docs.rs/nanocodex-tools)
+
+### `nanocodex-observability`
+
+Application-owned tracing and OpenTelemetry setup for the data already flowing
+through the agent. It provides structured lifecycle, model, tool, usage, cost,
+cache, and latency telemetry without changing the core runtime path.
+
+Enable the facade's `observability` feature or depend on the component
+directly.
+
+[Observability guide](crates/nanocodex-observability/README.md) ·
+[API documentation](https://docs.rs/nanocodex-observability)
+
+### Experimental components
+
+Components whose public contracts are still maturing live under
+[`crates/experimental/`](crates/experimental/README.md):
+
+| Package | Responsibility |
+| --- | --- |
+| [`nanocodex-voice`](crates/experimental/nanocodex-voice/README.md) | Desktop GPT Realtime audio and reusable voice-to-agent lifecycle |
+| [`nanocodex-vm`](crates/experimental/nanocodex-vm/README.md) | VM lifecycle and images plus retained guest-backed workspace tools |
+
+The CLI is a consumer of these crates. Voice and VM-backed tools remain thin,
+opt-in adapters over the stable library contracts.
+
+### CLI and language bindings
+
+The CLI/TUI, Python package, Node/browser package, React bindings, and examples
+are thin consumers of the same owned session API. They do not define a second
+agent protocol.
+
+[Examples](examples/README.md) · [JavaScript](js/README.md) ·
+[Python](py/README.md) · [Web](web/README.md)
+
+## VM-backed tools
+
+Normal TUI and one-shot sessions keep host workspace tools by default. They can
+instead route `exec_command`, `write_stdin`, `apply_patch`, and `view_image`
+through one retained VM:
 
 ```sh
-just eval-task-hosted terminal-bench/fix-git
-just eval-hosted
+just build-vm-guest
+nanocodex \
+  --vm .nanocodex/vm/session-rootfs.ext4 \
+  --vm-guest-runtime target/aarch64-unknown-linux-musl/debug/nanocodex-vm-guest \
+  --vm-workspace /app
+nanocodex run "inspect the repository" \
+  --vm .nanocodex/vm/session-rootfs.ext4 \
+  --vm-guest-runtime target/aarch64-unknown-linux-musl/debug/nanocodex-vm-guest \
+  --vm-workspace /app
 ```
 
-Retained jobs live under `.nanocodex/harbor/jobs`; `just view` opens them. The
-latest full 41-task gate scored 38/41 with zero Responses retries or WebSocket
-reconnects and 92.23% cached input. One task hit a transient upstream policy
-rejection after producing a verifier-passing artifact and passed an isolated
-rerun. Current architecture, validation policy, failure classifications, and
-ordered future work live in [`PLAN.md`](PLAN.md).
+Directory roots may instead contain
+`/usr/local/bin/nanocodex-vm-guest`. See the
+[VM guide](docs/VM.md) for image preparation, lifecycle, egress, Linux
+requirements, and macOS signing.
+
+## Documentation
+
+- [Facade API](https://docs.rs/nanocodex)
+- [Migration from 0.2.x](docs/MIGRATING.md)
+- [Examples](examples/README.md)
+- [Benchmarks and retained measurements](benchmarks/)
+- [VM-backed tools and egress](docs/VM.md)
+
+## License
+
+Licensed under either of:
+
+- Apache License, Version 2.0
+- MIT License
+
+at your option.

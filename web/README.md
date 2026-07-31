@@ -25,7 +25,14 @@ npm install
 npm run dev
 ```
 
-The local Worker and Vite client run together at `http://localhost:5173`, using
+The homepage consumes the publishable `nanocodex` and `nanocodex-react`
+packages under `../js`; it does not reach into generated WASM artifacts. Its
+React integration follows an external-store pattern: create a
+`createConfig()` once, pass it to `NanocodexProvider`, and consume
+`useNanocodex`, `useNanocodexMessage`, or `useConfig`. React owns no agent
+history, credential policy, or model-loop state.
+
+The local Worker and Vite client run together at `https://localhost:5173`, using
 the same Cloudflare Vite-plugin layout as Tempo's React MPP examples.
 
 `npm run dev` and `npm run build` first regenerate
@@ -47,6 +54,64 @@ The homepage and Evals view present the matched public task set as a provisional
 development instrument, not a general product ranking. The comparison links
 each disagreement back to its retained trial so compatibility gaps can be
 inspected directly.
+
+The homepage is also a real embedded-agent demo with three deliberately thin
+layers:
+
+- `../js/bindings` publishes `nanocodex`, the viem-v3-style imperative client.
+  Runtime entrypoints expose flattened `Agent.create` factories, decorated
+  domain actions, standalone `Actions` namespaces, and typed watcher handles.
+- `../js/react` publishes `nanocodex-react`, the wagmi-like headless React owner. Its provider and
+  hooks manage the module Worker lifecycle, readiness, commands, and event
+  subscriptions without imposing presentation policy.
+- `AgentTerminal` is the optimized Ratatui-faithful consumer: native colors,
+  rendering hierarchy, queue/steer behavior, `/btw`, historical branch editing,
+  branch navigation, per-branch drafts, clipboard images, and key bindings over
+  virtualized transcripts.
+
+The module Worker loads the generated `nanocodex-wasm` package, and the Rust
+engine owns the persistent Responses session, typed history, event stream, and
+tool loop. The Cloudflare Worker upgrades `/api/responses` and proxies OpenAI
+tool calls. It accepts a user-provided OpenAI key into a one-hour Durable Object
+session and returns only an opaque `HttpOnly`, `SameSite=Strict` cookie. The key
+is never placed in a URL, local storage, React state, or WASM configuration.
+A user key takes precedence over the optional deployment-owned
+`OPENAI_API_KEY`; forgetting or expiring it falls back to that deployment key
+when present.
+
+OpenAI remains the default agent connection. A user can explicitly select
+Tempo MPP instead; only then does React lazy-load Wagmi and Tempo Accounts,
+open the standard embedded Tempo Wallet dialog for its account and passkey flow, and
+authorize a bounded one-day access key in that same Accounts connection
+ceremony. The
+module Worker hydrates that delegated signer from Accounts' IndexedDB storage
+and gives it to an mppx session manager with a durable channel store. The same
+MPP channel is reused across turns and reloads and is not closed by Nanocodex.
+Wallet, payer, delegated signer, channel, cumulative authorization, and the
+agent event JSONL are shown only while the MPP route is selected. The normal
+OpenAI route does not initialize or expose any payment state.
+
+Development uses `vite-plugin-mkcert` because the Accounts SDK intentionally
+falls back to a popup on plain HTTP. Cross-origin passkeys inside the hosted
+Tempo Wallet iframe require a secure context; trusted local HTTPS exercises the
+same embedded flow as production.
+
+Local development reads the optional ignored root `.env` through the repository
+workflow. For a shared demo fallback, configure the deployed Worker with
+`wrangler secret put OPENAI_API_KEY`. BYOK itself uses the `BYOK_SESSIONS`
+Durable Object binding declared in `wrangler.jsonc` and does not require a
+deployment-owned OpenAI key.
+
+Streaming events are coalesced once per animation frame before updating the
+semantic transcript, and each independently scrolling transcript is
+virtualized. `npm test` keeps the
+event accumulator bounded under a 20,000-delta burst and covers assistant,
+reasoning, and tool lifecycle updates.
+
+The homepage also exposes the release contract: the checksum-verifying install
+command, in-place `nanocodex update`, the crates.io SDK entry point, and links
+to the latest GitHub Release and grouped conventional-commit changelog. GitHub
+release notes also credit each pull request contributor.
 
 Navigation stays available whenever an input is not active: `H`, `T`, `C`, `R`,
 and `E` switch between Home, Code, Commits, Requests, and Evals. The repository
