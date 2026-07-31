@@ -205,3 +205,36 @@
 - Do not expose raw transport response IDs or internal turn IDs. Branching may
   be exposed through opaque checkpoints on completed typed turn results only
   after the behavior is implemented end to end.
+
+## Cursor Cloud specific instructions
+
+These notes are for cloud agents booting into an environment where the startup
+update script has already refreshed dependencies. Standard commands live in the
+`Justfile` and `README.md`; only the non-obvious caveats are captured here.
+
+- Toolchain gotcha: the workspace is edition 2024 and pins `rust-version = "1.97"`,
+  but the base image ships an older default (1.83). The update script installs
+  and sets `1.97.0` (with `clippy` + `rustfmt`) as the rustup default. If the
+  pinned `rust-version` in `Cargo.toml` is ever bumped again, update the startup
+  script to match, otherwise `cargo` refuses to build until a new-enough
+  toolchain is the active default.
+- `uv` and `just` are installed to `~/.local/bin`. Interactive shells get this on
+  `PATH` via `~/.bashrc`, but non-interactive shells may not, so invoke them by
+  full path (`~/.local/bin/just`, `~/.local/bin/uv`) or export the path first if a
+  command reports "command not found".
+- `OPENAI_API_KEY` is required for any live turn (`just run`, the `examples/`
+  binaries, and model-backed evals). It is provided as an environment secret; do
+  not commit it or echo it into logs/JSONL. Lint and `cargo test --workspace` do
+  NOT need it.
+- Node.js must be on `PATH` (present by default). Code mode executes the model's
+  JavaScript locally and calls back into the Rust tool registry, so a missing
+  Node breaks the `exec` tool even though the model call succeeds.
+- Fast dev loop: `just run` is the native end-to-end smoke (prompt -> Responses
+  WebSocket -> local code-mode tool exec -> typed JSONL on stdout, diagnostics on
+  stderr). `just check` is the full gate (fmt, clippy `-D warnings`, workspace
+  tests, Harbor adapter Python `unittest`, and two Harbor `--print-config`
+  validations). All of these pass in this environment without Docker.
+- Harbor eval execution (`just eval`, `just build-agent`, `just prepare-evals`)
+  and hosted Daytona evals are OPTIONAL and NOT set up here: they require a Docker
+  daemon (absent by default) and, for hosted runs, `DAYTONA_*` credentials. The
+  `--print-config` steps in `just check` only validate config and need neither.
