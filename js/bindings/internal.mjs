@@ -141,6 +141,7 @@ export function toWasmConfig(options = {}) {
     throw new TypeError("apiKey must be a non-empty string");
   }
   const config = { api_key: apiKey };
+  copy(config, "model", options.model);
   copy(config, "thinking", options.thinking);
   copy(config, "reasoning_mode", options.reasoningMode);
   copy(config, "fast_mode", options.fastMode);
@@ -234,6 +235,13 @@ const hostBridge = Object.freeze({
   },
   executeCode(source, sessionId, callId) {
     return requiredSessionHost(sessionId).executeCode(source, sessionId, callId);
+  },
+  executeTool(name, input, sessionId, callId) {
+    return requiredSessionHost(sessionId).executeTool(name, input, sessionId, callId);
+  },
+  toolMode(sessionId) {
+    // The WASM constructor asks before its session is adopted.
+    return (hostSessions.get(sessionId) ?? requiredActiveHost()).toolMode();
   },
   toolDefinitions(sessionId) {
     // ModelRun builds its stable tool prefix inside the WASM constructor,

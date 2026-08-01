@@ -17,10 +17,12 @@ let initialized;
 export function create(options = {}) {
   const {
     apiKey,
+    hostAuth,
     mpp,
     websocketUrl,
     apiBaseUrl,
     module,
+    model,
     thinking,
     reasoningMode,
     fastMode,
@@ -31,17 +33,23 @@ export function create(options = {}) {
     WebSocketImpl,
     createWebSocket,
     tools,
+    toolMode,
   } = options;
   if (mpp !== undefined && apiKey !== undefined) {
     throw new TypeError("apiKey and mpp are mutually exclusive");
+  }
+  if (hostAuth && (apiKey !== undefined || mpp !== undefined)) {
+    throw new TypeError("hostAuth is mutually exclusive with apiKey and mpp");
   }
   const events = createEventChannel();
   const host = createBrowserHost({
     WebSocketImpl,
     createWebSocket,
+    hostAuth: hostAuth === true || (apiKey === undefined && mpp === undefined),
     mpp,
     onEvent: events.emit,
     tools,
+    toolMode,
   });
   activateHost(host);
   const runtime = defineRuntime({
@@ -68,6 +76,7 @@ export function create(options = {}) {
     decorate: (agent) => agent.extend(agentActions()),
   });
   return createAgentClient(runtime, {
+    model,
     thinking,
     reasoningMode,
     fastMode,

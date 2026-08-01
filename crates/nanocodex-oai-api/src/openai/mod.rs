@@ -6,7 +6,7 @@ mod config;
 mod platform;
 
 use crate::{
-    DefaultResponsesService, OpenAiAuth, OpenAiAuthError, OpenAiAuthMode, ReasoningMode,
+    DefaultResponsesService, Model, OpenAiAuth, OpenAiAuthError, OpenAiAuthMode, ReasoningMode,
     ResponsesHistory, ResponsesRetryPolicy, ResponsesTransport, Thinking, session::SessionBuilder,
 };
 
@@ -118,6 +118,16 @@ pub struct OpenAiBuilder<F = StandardServiceFactory> {
 }
 
 impl<F> OpenAiBuilder<F> {
+    /// Selects the default GPT-5.6 coding model for new sessions and agents.
+    ///
+    /// A higher-level session or agent builder may override this reusable
+    /// client default without mutating the `OpenAi` recipe.
+    #[must_use]
+    pub const fn model(mut self, model: Model) -> Self {
+        self.config.model = model;
+        self
+    }
+
     /// Selects the initial Responses transport policy for new sessions.
     ///
     /// [`ResponsesTransport::WebSocket`] prefers a persistent socket. The
@@ -353,6 +363,8 @@ where
     /// Returns an error for unavailable credentials or an incompatible
     /// transport, storage, and replay configuration.
     pub fn build(self) -> Result<OpenAi<F>, OpenAiError> {
+        #[cfg(not(target_family = "wasm"))]
+        crate::transport::install_default_rustls_crypto_provider();
         validate(&self.config)?;
         self.factory.validate_config(&self.config)?;
         Ok(OpenAi {
@@ -372,6 +384,8 @@ pub struct StandardServiceFactory {
 
 impl Default for StandardServiceFactory {
     fn default() -> Self {
+        #[cfg(not(target_family = "wasm"))]
+        crate::transport::install_default_rustls_crypto_provider();
         Self {
             max_attempts: ResponsesRetryPolicy::DEFAULT_MAX_ATTEMPTS,
             platform: platform::FactoryPlatform::new(),

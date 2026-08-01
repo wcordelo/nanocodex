@@ -3,10 +3,10 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub use nanocodex_agent::{
-    AgentEvents, CostStatus, EstimatedUsdCost, Nanocodex, NanocodexBuilder, NanocodexError,
-    PromptRoute, ServiceTier, Turn, TurnControl, TurnResult, TurnUsage, UsdAmount,
+    AgentEvents, AgentSessionContext, CostStatus, EstimatedUsdCost, Nanocodex, NanocodexBuilder,
+    NanocodexError, PromptRoute, ServiceTier, Turn, TurnControl, TurnResult, TurnUsage, UsdAmount,
 };
-pub use nanocodex_oai_api::{OpenAi, ReasoningMode, Thinking};
+pub use nanocodex_oai_api::{Model, OpenAi, ReasoningMode, Thinking};
 #[cfg(not(target_family = "wasm"))]
 #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
 pub use nanocodex_tools::tool;
@@ -21,9 +21,9 @@ pub mod agent {
     #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
     pub use nanocodex_agent::rollout;
     pub use nanocodex_agent::{
-        AgentEvents, AgentHandle, CostStatus, EstimatedUsdCost, Nanocodex, NanocodexBuilder,
-        NanocodexError, PromptRoute, Result, ServiceTier, Turn, TurnControl, TurnResult, TurnUsage,
-        UsdAmount, events, input, session, usage,
+        AgentEvents, AgentHandle, AgentSessionContext, CostStatus, EstimatedUsdCost, Nanocodex,
+        NanocodexBuilder, NanocodexError, PromptRoute, Result, ServiceTier, Turn, TurnControl,
+        TurnResult, TurnUsage, UsdAmount, events, input, session, usage,
     };
 }
 
@@ -49,7 +49,7 @@ pub mod prelude {
     #[cfg(not(target_family = "wasm"))]
     #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
     pub use crate::tool;
-    pub use crate::{Nanocodex, NanocodexBuilder, OpenAi, Tool, Tools};
+    pub use crate::{Model, Nanocodex, NanocodexBuilder, OpenAi, Tool, Tools};
 }
 
 #[cfg(not(target_family = "wasm"))]

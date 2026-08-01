@@ -23,9 +23,9 @@ use nanocodex_oai_api::{
         EventSink, ManagedSessionState, ModelConfig, ResponsesAttemptFactory,
         assign_missing_response_item_id, compaction, with_code_mode_tool_names,
     },
-    CONTEXT_WINDOW_TOKENS, MODEL, Prompt, Thinking,
+    CONTEXT_WINDOW_TOKENS, Model, Prompt, Thinking,
     events::AgentEventKind,
-    pricing::{ServiceTier, estimate},
+    pricing::{ServiceTier, estimate_for_model},
     responses::{ContentItem, MessageRole, RequestProfile, ResponseItem, ToolDefinition, Usage},
     tower::{
         CodeCall, CodeCallKind, GenerationOutput as TurnResult, ResponsesAttempt, ResponsesClient,
@@ -72,6 +72,7 @@ use nanocodex_tools::{
 pub(crate) struct ModelRun<S> {
     events: EventSink,
     config: Arc<ModelConfig>,
+    model: Model,
     thinking: Thinking,
     fast_mode: bool,
     client: ResponsesClient<S>,
@@ -88,6 +89,7 @@ pub(crate) struct ModelRun<S> {
     context_source: ContextSource,
     global_instructions: Option<Arc<str>>,
     force_compaction: bool,
+    pending_developer_messages: Vec<ResponseItem>,
 }
 
 pub(crate) enum ModelTurnOutcome {
@@ -207,12 +209,14 @@ impl<S> ModelRun<S> {
         prompt_cache: ModelPromptCache,
         context_source: ContextSource,
     ) -> Self {
+        let model = config.model;
         let thinking = config.thinking;
         let fast_mode = config.fast_mode;
         let global_instructions = context_source.global_instructions();
         Self {
             events,
             config,
+            model,
             thinking,
             fast_mode,
             client,
@@ -229,6 +233,7 @@ impl<S> ModelRun<S> {
             context_source,
             global_instructions,
             force_compaction: false,
+            pending_developer_messages: Vec::new(),
         }
     }
 
@@ -261,6 +266,7 @@ impl<S> ModelRun<S> {
             events.clone(),
             Arc::clone(&transport_stats),
         );
+        let model = config.model;
         let thinking = config.thinking;
         let fast_mode = config.fast_mode;
         let context_source =
@@ -269,6 +275,7 @@ impl<S> ModelRun<S> {
         Self {
             events,
             config,
+            model,
             thinking,
             fast_mode,
             client,
@@ -292,6 +299,7 @@ impl<S> ModelRun<S> {
             context_source,
             global_instructions,
             force_compaction: false,
+            pending_developer_messages: Vec::new(),
         }
     }
 
@@ -310,6 +318,30 @@ impl<S> ModelRun<S> {
         if let Some(tools) = &self.active_tools {
             tools.cancel().await;
         }
+    }
+
+    pub(crate) fn append_developer_message(&mut self, text: String) -> Option<ModelCheckpoint> {
+        let item = ResponseItem::message(
+            MessageRole::Developer,
+            [ContentItem::InputText {
+                text: text.into_boxed_str(),
+            }],
+        );
+        let Some(session) = &mut self.session else {
+            self.pending_developer_messages.push(item);
+            return None;
+        };
+        session.conversation.append([item]);
+        session.conversation.commit_tail();
+        Some(ModelCheckpoint {
+            workspace: session.workspace.clone(),
+            conversation: session.conversation.clone(),
+            request_prefix: session.factory.profile().shared_prefix(),
+            prompt_cache_key: Arc::from(session.factory.profile().prompt_cache_key()),
+            preserve_inherited_delta: false,
+            global_instructions: self.global_instructions.clone(),
+            context_baseline: session.context.baseline(),
+        })
     }
 
     fn empty_session(&mut self, requested_workspace: Option<&str>) -> Result<ModelSessionState> {

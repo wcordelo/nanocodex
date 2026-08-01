@@ -14,7 +14,7 @@ use std::{
 use futures_util::Stream;
 use nanocodex_oai_api::{
     __private::{EventSink, ModelConfig, ResponsesServiceFactory, into_openai_parts},
-    OpenAi, Prompt, ReasoningMode, ResponseError, Thinking,
+    Model, OpenAi, Prompt, ReasoningMode, ResponseError, Thinking,
     auth::OpenAiAuthMode,
     events::{AgentEvent, AgentEvents},
     session::SessionId,
@@ -93,11 +93,13 @@ mod driver;
 mod durability;
 mod executor;
 mod handle;
+mod session_context;
 mod spawn;
 mod turn;
 
 pub use builder::NanocodexBuilder;
 pub use handle::{AgentHandle, Nanocodex};
+pub use session_context::AgentSessionContext;
 pub use turn::{PromptRoute, Turn, TurnControl, TurnResult};
 
 use builder::{CodexCompatibility, PromptCacheConfig};

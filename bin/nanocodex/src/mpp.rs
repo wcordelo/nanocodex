@@ -1,9 +1,15 @@
 use std::path::PathBuf;
 
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "musl")),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+use std::path::Path;
+
 mod egress;
 mod resource;
 
-use self::egress::{EgressPolicy, MppEgress};
+use self::egress::TempoEgress;
 use clap::{ArgAction, Args, builder::NonEmptyStringValueParser};
 use eyre::{Context, Result, eyre};
 use mpp::{
@@ -15,11 +21,30 @@ use mpp::{
         methods::tempo::{INTENT_CHARGE, METHOD_NAME},
     },
 };
+use nanocodex_egress::EgressProxy;
 use nanousd::{NANOUSD_ADDRESS, TEMPO_MAINNET_CHAIN_ID};
+
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "musl")),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+use nanocodex_vm::host::{EgressFile, GUEST_EGRESS_ROOT};
+
+use crate::vm::EgressLease;
 
 const DEFAULT_MPP_API_BASE_URL: &str = "https://openai.mpp.tempo.xyz/v1";
 const DEFAULT_TEMPO_SWAP_SLIPPAGE_BPS: u16 = 100;
 const DEFAULT_MAX_EGRESS_CHARGE: u128 = 100_000;
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "musl")),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+const GUEST_EGRESS_DIRECTORY: &str = "tempo";
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "musl")),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+const GUEST_EGRESS_CA_FILENAME: &str = "egress-ca.pem";
 
 #[derive(Args, Clone)]
 pub(crate) struct MppArgs {
@@ -104,23 +129,37 @@ impl MppArgs {
         }
 
         resource::ensure_mpp_file_descriptor_capacity()?;
+        let api_base_url = normalize_api_base_url(&self.api_base_url)?;
+        let allow_loopback = reqwest::Url::parse(&api_base_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .is_some_and(|host| {
+                host.eq_ignore_ascii_case("localhost")
+                    || host
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|address| address.is_loopback())
+            });
         let provider = self.wallet_store.map_or_else(
             TempoAccountsProvider::from_default_store,
             TempoAccountsProvider::from_store,
         )?;
         let provider = provider
             .with_expected_chain_id(TEMPO_MAINNET_CHAIN_ID)
+            .with_preferred_currency(NANOUSD_ADDRESS)
             .with_autoswap(AutoswapConfig::new(NANOUSD_ADDRESS, self.swap_slippage_bps));
         let provider = CappedChargeProvider {
             provider,
             max_charge: self.egress_max_charge,
         };
-        let egress = MppEgress::start(provider, EgressPolicy::default())
+        let egress = EgressProxy::builder()
+            .allow_loopback_upstreams(allow_loopback)
+            .layer(TempoEgress::new(provider))
+            .spawn()
             .await
             .wrap_err("failed to start the embedded MPP egress proxy")?;
 
         Ok(Some(MppAdapter {
-            api_base_url: normalize_api_base_url(&self.api_base_url)?,
+            api_base_url,
             mpp_api_key: self.mpp_api_key,
             egress: Some(egress),
         }))
@@ -139,6 +178,13 @@ where
 {
     fn supports(&self, method: &str, intent: &str) -> bool {
         self.provider.supports(method, intent)
+    }
+
+    fn select_challenge<'a>(
+        &self,
+        challenges: &[&'a PaymentChallenge],
+    ) -> Option<&'a PaymentChallenge> {
+        self.provider.select_challenge(challenges)
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
@@ -206,7 +252,7 @@ fn normalize_api_base_url(value: &str) -> Result<String> {
 pub(crate) struct MppAdapter {
     api_base_url: String,
     mpp_api_key: Option<String>,
-    egress: Option<MppEgress>,
+    egress: Option<EgressProxy>,
 }
 
 impl MppAdapter {
@@ -215,9 +261,55 @@ impl MppAdapter {
     }
 
     pub(crate) fn tool_environment(&self) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
-        self.egress
+        self.egress.as_ref().map_or_else(Vec::new, |egress| {
+            egress.environment().into_iter().collect()
+        })
+    }
+
+    #[cfg(any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
+    pub(crate) fn vm_egress_lease(&self) -> Result<EgressLease> {
+        let egress = self
+            .egress
             .as_ref()
-            .map_or_else(Vec::new, MppEgress::environment)
+            .ok_or_else(|| eyre!("MPP egress proxy is not running"))?;
+        let route = egress.route();
+        let guest_certificate = Path::new(GUEST_EGRESS_ROOT)
+            .join(GUEST_EGRESS_DIRECTORY)
+            .join(GUEST_EGRESS_CA_FILENAME);
+        let mut lease = EgressLease::internet();
+        lease
+            .insert_file(EgressFile::new(
+                &guest_certificate,
+                route.ca_certificate_pem(),
+                0o444,
+            ))
+            .wrap_err("failed to provision the MPP egress CA in the VM")?;
+        for (name, value) in route.environment(&guest_certificate) {
+            let name = name
+                .into_string()
+                .map_err(|_| eyre!("MPP egress environment name is not valid UTF-8"))?;
+            let value = value
+                .into_string()
+                .map_err(|_| eyre!("MPP egress environment value for {name} is not valid UTF-8"))?;
+            lease
+                .insert_environment(name, value)
+                .wrap_err("failed to configure MPP egress environment in the VM")?;
+        }
+        Ok(lease)
+    }
+
+    #[cfg(not(any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    )))]
+    pub(crate) fn vm_egress_lease(&self) -> Result<EgressLease> {
+        Err(eyre!(
+            "provider-backed VM egress is unsupported on {}",
+            std::env::consts::ARCH
+        ))
     }
 
     fn http_client_builder(&self) -> Result<reqwest::ClientBuilder> {
@@ -225,7 +317,7 @@ impl MppAdapter {
             .egress
             .as_ref()
             .ok_or_else(|| eyre!("MPP egress proxy is not running"))?;
-        let certificate = std::fs::read(egress.certificate_path())
+        let certificate = std::fs::read(egress.ca_certificate_path())
             .wrap_err("failed to read the MPP egress CA certificate")?;
         let certificate = reqwest::Certificate::from_pem(&certificate)
             .wrap_err("failed to parse the MPP egress CA certificate")?;
@@ -293,11 +385,30 @@ mod tests {
         payments: Arc<AtomicUsize>,
         commits: Arc<AtomicUsize>,
         rollbacks: Arc<AtomicUsize>,
+        select_last: bool,
+    }
+
+    impl MockProvider {
+        fn selecting_last(mut self) -> Self {
+            self.select_last = true;
+            self
+        }
     }
 
     impl PaymentProvider for MockProvider {
         fn supports(&self, method: &str, intent: &str) -> bool {
             method == "tempo" && intent == "charge"
+        }
+
+        fn select_challenge<'a>(
+            &self,
+            challenges: &[&'a PaymentChallenge],
+        ) -> Option<&'a PaymentChallenge> {
+            if self.select_last {
+                challenges.last().copied()
+            } else {
+                challenges.first().copied()
+            }
         }
 
         async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
@@ -350,9 +461,63 @@ mod tests {
         PaymentChallenge::new("challenge", "api.example.com", "tempo", "charge", request)
     }
 
+    #[test]
+    fn capped_provider_preserves_inner_challenge_selection() {
+        let provider = CappedChargeProvider {
+            provider: MockProvider::default().selecting_last(),
+            max_charge: DEFAULT_MAX_EGRESS_CHARGE,
+        };
+        let first = challenge("1");
+        let mut preferred = challenge("1");
+        preferred.id = "preferred".to_owned();
+
+        assert_eq!(
+            provider
+                .select_challenge(&[&first, &preferred])
+                .map(|challenge| challenge.id.as_str()),
+            Some("preferred")
+        );
+    }
+
     #[tokio::test]
     async fn mpp_is_opt_in() {
         assert!(test_args().start().await.unwrap().is_none());
+    }
+
+    #[cfg(any(
+        all(target_os = "linux", not(target_env = "musl")),
+        all(target_os = "macos", target_arch = "aarch64")
+    ))]
+    #[tokio::test]
+    async fn vm_lease_contains_only_the_proxy_route_and_public_ca() {
+        let egress = EgressProxy::builder().spawn().await.unwrap();
+        let proxy_url = egress.route().proxy_url().to_owned();
+        let adapter = MppAdapter {
+            api_base_url: DEFAULT_MPP_API_BASE_URL.to_owned(),
+            mpp_api_key: None,
+            egress: Some(egress),
+        };
+
+        let lease = adapter.vm_egress_lease().unwrap();
+        let guest_certificate = Path::new(GUEST_EGRESS_ROOT)
+            .join(GUEST_EGRESS_DIRECTORY)
+            .join(GUEST_EGRESS_CA_FILENAME);
+
+        assert_eq!(
+            lease.guest_environment().get("HTTPS_PROXY"),
+            Some(&proxy_url)
+        );
+        assert_eq!(
+            lease.guest_environment().get("SSL_CERT_FILE"),
+            Some(&guest_certificate.to_string_lossy().into_owned())
+        );
+        let file = lease.guest_files().next().unwrap();
+        assert_eq!(file.guest_path(), guest_certificate);
+        assert!(file.contents().starts_with(b"-----BEGIN CERTIFICATE-----"));
+        assert!(lease.guest_environment().keys().all(|name| {
+            !name.contains("WALLET") && !name.contains("PRIVATE") && !name.contains("SECRET")
+        }));
+        adapter.shutdown().await.unwrap();
     }
 
     #[tokio::test]
