@@ -36,16 +36,23 @@ if let Some(cost) = completed.estimated_cost() {
 # }
 ```
 
-This crate supports `gpt-5.6-sol` (the default) and `gpt-5.6-luna`. Select a
-client default with `OpenAi::builder(auth).model(Model::Luna)`. A session keeps
-that model for its lifetime, and each replayable attempt retains it across
-retries. Changing models would invalidate the provider checkpoint and require
-an inefficient replay of the complete retained context.
+This crate supports `gpt-5.6-sol` (the default), `gpt-5.6-terra`, and
+`gpt-5.6-luna`. Select a client default with
+`OpenAi::builder(auth).model(Model::Terra)`. A session keeps that model for its
+lifetime, and each replayable attempt retains it across retries. Changing
+models would invalidate the provider checkpoint and require an inefficient
+replay of the complete retained context.
+
+API-key HTTPS OpenAI routing gateways may qualify those same closed model
+identifiers with `OpenAi::builder(auth).model_id_prefix("openai")`. The prefix
+changes only the wire model ID; model-specific reasoning, compaction, pricing,
+and snapshots continue to use the typed [`Model`] value. It does not add an
+alternate provider or arbitrary-model surface.
 
 USD estimates require no pricing configuration. Each model applies its
 published standard rates, or its priority rates when
-[`OpenAiBuilder::fast_mode`] is enabled. Luna usage receives the same complete
-estimate and status treatment as Sol. Provider-omitted usage remains
+[`OpenAiBuilder::fast_mode`] is enabled. Terra and Luna usage receive the same
+complete estimate and status treatment as Sol. Provider-omitted usage remains
 distinguishable as `usage_not_reported`.
 
 ## ChatGPT subscription login
@@ -175,6 +182,15 @@ The higher-level `nanocodex-agent` crate decides *when* to compact and how to
 execute tools. This crate implements the provider operation and atomic history
 replacement without embedding agent policy.
 
+## Attempt accounting
+
+Transport metrics distinguish physical Responses attempts from retries. A sent
+attempt that is cancelled or fails before a provider terminal event increments
+`billing_uncertain_response_attempts`; its `ModelAttemptFailed` event also sets
+`billing_uncertain`. This does not assume that the provider charged the request.
+It records that observed token usage is only a lower bound, while completed and
+provider-rejected responses remain exact.
+
 ## Contract-only builds
 
 The default `client` feature remains the complete OpenAI boundary, including
@@ -192,6 +208,12 @@ a `nanocodex-tools::Tools` registry automatically. Use `nanocodex-agent` for
 that batteries-included composition. Consumers implementing their own loop can
 install definitions with [`SessionBuilder::tool_definitions`] and return paired
 tool outputs with [`session::ResponseInput::items`].
+
+[`tools::ToolDefinition::namespace`] represents the provider-native Responses
+namespace shape for related function tools. Function output schemas remain
+client-owned execution metadata: they are available through
+[`tools::ToolDefinition::output_schema`] for Code Mode declarations but are not
+serialized into the provider's function declaration.
 
 ## Going lower level
 

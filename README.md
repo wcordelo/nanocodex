@@ -11,7 +11,9 @@
 
 **[Install](#install)** · **[Agent API](#minimal-api-example)** ·
 **[Thesis](#thesis)** · **[Components](#components)** ·
-**[VM-backed tools](#vm-backed-tools)** · **[Documentation](#documentation)**
+**[VM-backed tools](#vm-backed-tools)** ·
+**[Evaluation](crates/experimental/nanocodex-eval/README.md)** ·
+**[Documentation](#documentation)**
 
 [ci]: https://github.com/gakonst/nanocodex/actions/workflows/ci.yml
 [crates]: https://crates.io/crates/nanocodex
@@ -100,10 +102,17 @@ history, WebSocket, tools, shell sessions, and prompt-cache identity.
 `agent.clone()` is a cheap handle to that same session; the independently
 returned `AgentEvents` stream is the session-wide event firehose.
 
-Nanocodex supports `gpt-5.6-sol` (the default) and `gpt-5.6-luna`. Select the
-model with `.model(Model::Luna)` when creating an agent. The model is fixed for
-that thread: switching later would invalidate the provider checkpoint and
-require an inefficient replay of the complete retained context.
+Nanocodex supports `gpt-5.6-sol` (the default), `gpt-5.6-terra`, and
+`gpt-5.6-luna`. Select a model with `.model(Model::Terra)` or
+`.model(Model::Luna)` when creating an agent. The model is fixed for that
+thread: switching later would invalidate the provider checkpoint and require
+an inefficient replay of the complete retained context.
+
+API-key HTTPS OpenAI routing gateways that namespace model identifiers can set
+`NANOCODEX_MODEL_ID_PREFIX`. For example, a prefix of `openai` sends
+`openai/gpt-5.6-sol` on the wire while preserving Sol's typed behavior,
+pricing, compaction, and snapshot identity inside Nanocodex. This does not add
+an alternate provider or arbitrary-model surface.
 
 ## Voice: devices or Unix pipes
 
@@ -252,9 +261,11 @@ Components whose public contracts are still maturing live under
 | --- | --- |
 | [`nanocodex-voice`](crates/experimental/nanocodex-voice/README.md) | Desktop GPT Realtime audio and reusable voice-to-agent lifecycle |
 | [`nanocodex-vm`](crates/experimental/nanocodex-vm/README.md) | VM lifecycle and images plus retained guest-backed workspace tools |
+| [`nanocodex-eval`](crates/experimental/nanocodex-eval/README.md) | VM-backed evaluation, canonical verification, durable evidence, and live stock-Codex differential analysis |
 
 The CLI is a consumer of these crates. Voice and VM-backed tools remain thin,
-opt-in adapters over the stable library contracts.
+opt-in adapters over the stable library contracts for normal agent sessions;
+VM-backed execution is mandatory for benchmark eval commands.
 
 ### CLI and language bindings
 
@@ -294,6 +305,7 @@ requirements, and macOS signing.
 - [Migration from 0.2.x](docs/MIGRATING.md)
 - [Examples](examples/README.md)
 - [Benchmarks and retained measurements](benchmarks/)
+- [VM evaluation and stock-Codex differential runs](crates/experimental/nanocodex-eval/README.md)
 - [VM-backed tools and egress](docs/VM.md)
 
 ## License

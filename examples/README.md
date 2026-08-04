@@ -14,7 +14,13 @@ All language consumers live at this repository boundary:
 - Browser CDN: `browser-cdn/` is one static HTML file that imports the published
   package directly, with no install or build step.
 - Rivet Actors: `rivet-actors/` runs the same harness as a durable,
-  SQLite-backed Rivet Actor.
+  SQLite-backed Rivet Actor with an actor-owned AgentOS sandbox.
+- Cloudflare Workers: `cloudflare-workers/` runs the Rust/WASM harness inside a
+  SQLite-backed Durable Object, with a Sandbox container and R2-backed
+  workspace, and proves hibernation-safe session recovery.
+- Vercel Workflows: `vercel-workflows/` runs Nanocodex as a durable Workflow
+  actor with a persistent Vercel Sandbox, replayable state, and synchronized
+  native WebSocket clients.
 
 From the repository root:
 
@@ -38,6 +44,8 @@ just smoke-python
 just smoke-wasm-node
 just build-react-example
 just build-rivet-example
+just build-cloudflare-example
+just build-vercel-example
 ```
 
 `voice` is the dead-simple non-TUI desktop consumer. It uses the same
