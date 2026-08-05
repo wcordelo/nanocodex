@@ -54,6 +54,11 @@ Matching Codex, direct-plus-Code-Mode exposure keeps `exec` terse and
 adds each typed `exec` declaration to the corresponding direct tool; Code
 Mode-only instead carries the complete nested catalog in `exec`. Selection
 changes model-visible exposure, not registration or dispatch behavior.
+`tool_with_exposure` can override one registered tool with `DirectOnly`,
+`CodeModeOnly`, `DirectAndCodeMode`, or `Hidden` while preserving the global
+default for the rest. Host-owned `exec`, `wait`, and `tool_search` names cannot
+be replaced, and the first tool registered for a normalized JavaScript name
+wins the nested Code Mode surface.
 Namespaced Code Mode names such as `image_gen__imagegen` remain available to
 `exec`; normal Code Mode exposes the Codex-compatible `image_gen.imagegen`
 Responses namespace and routes its namespaced call to the same handler.
@@ -141,9 +146,15 @@ let tools = Tools::builder().provider(mcp).build()?;
 Handshakes and discovery start with the owning runtime. Both exposure policies
 keep the provider-native `tool_search` visible while omitting deferred MCP
 schemas from the initial request. Code Mode lists those deferred tools as
-compact name/description entries in `ALL_TOOLS`. Search results contain
+compact name/description entries in `ALL_TOOLS`; `toolSchema(name)` returns a
+cloned input/output JSON Schema on demand when generated code needs the exact
+payload contract. Search results contain
 loadable MCP namespaces for direct model calls and also activate matching Code
 Mode definitions, keeping large catalogs out of the initial tool list.
+`McpServer::tool_exposure` independently selects `DeferredOnly`,
+`CodeModeOnly`, `DeferredAndCodeMode`, or `Hidden` for each server. Automatic
+catalog and aggregate resource pagination is bounded by page, item, cursor,
+and wall-clock limits.
 
 ## Companion workspace runtimes
 

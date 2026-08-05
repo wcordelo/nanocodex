@@ -106,14 +106,25 @@ const EXEC_DESCRIPTION: &str = r#"Run JavaScript code to orchestrate/compose too
 - `setTimeout(callback: () => void, delayMs?: number)`: schedules a callback to run later and returns a timeout id. Pending timeouts do not keep `exec` alive by themselves; await an explicit promise if you need to wait for one.
 - `clearTimeout(timeoutId?: number)`: cancels a timeout created by `setTimeout`.
 - `ALL_TOOLS`: metadata for the enabled nested tools as `{ name, description }` entries.
+- `toolSchema(name: string)`: returns cloned `{ inputSchema, outputSchema }` JSON Schemas for one enabled nested tool, or `undefined` when the name is unknown. Use it inside Code Mode to inspect deferred-tool payloads without emitting the complete schema.
 - `yield_control()`: yields the accumulated output to the model immediately while the script keeps running."#;
 
 pub(super) fn exec_description(
     definitions: &[ToolDefinition],
+    provider_summaries: &[(String, String)],
     has_deferred_tools: bool,
     code_mode_only: bool,
 ) -> String {
     let mut description = EXEC_DESCRIPTION.to_owned();
+    if !provider_summaries.is_empty() {
+        description.push_str("\n\nAdditional runtime-provided nested tools:");
+        for (name, summary) in provider_summaries {
+            let _ = write!(description, "\n- `tools.{name}`: {}", summary.trim());
+        }
+        description.push_str(
+            "\nInspect the matching `ALL_TOOLS` entry for complete guidance before using an unfamiliar runtime-provided tool.",
+        );
+    }
     if has_deferred_tools {
         let _ = write!(description, "\n\n{DEFERRED_NESTED_TOOLS_GUIDANCE}");
     }
@@ -484,7 +495,7 @@ mod tests {
             ["apply_patch", "write_stdin", "image_gen__imagegen"]
         );
 
-        let description = exec_description(&definitions, false, true);
+        let description = exec_description(&definitions, &[], false, true);
         let namespace = description
             .find("## image_gen\nTools in the image_gen namespace.")
             .unwrap();
@@ -500,7 +511,7 @@ mod tests {
             json!({"type": "object"}),
         )];
 
-        let description = exec_description(&definitions, false, false);
+        let description = exec_description(&definitions, &[], false, false);
 
         assert!(
             description.contains(
@@ -512,5 +523,19 @@ mod tests {
         ));
         assert!(!description.contains("### `update_plan`"));
         assert!(!description.contains("declare const tools"));
+    }
+
+    #[test]
+    fn runtime_provider_summaries_are_visible_without_their_schemas() {
+        let summaries = vec![(
+            "browser".to_owned(),
+            "Control the host-managed browser session.".to_owned(),
+        )];
+
+        let description = exec_description(&[], &summaries, false, true);
+
+        assert!(description.contains("`tools.browser`: Control the host-managed browser session."));
+        assert!(description.contains("Inspect the matching `ALL_TOOLS` entry"));
+        assert!(!description.contains("declare const tools: { browser"));
     }
 }
