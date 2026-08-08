@@ -1,58 +1,40 @@
 //! Typed, VM-isolated evaluation for Nanocodex agents.
 //!
-//! This crate owns task loading, bounded scheduling, resumable jobs, typed
-//! events and outcomes, and task × agent × trial sweeps. Every benchmark
-//! attempt executes its tools and verifier in a prepared microVM.
+//! This crate owns task loading, durable SQLite worksets, typed events and
+//! outcomes, and VM-isolated execution. Applications choose one exact workset
+//! coordinate family; SQLite allocates its internal repetition and fences the
+//! accepted completion.
 //!
-//! # Run a sweep
+//! # Open a durable workset
 //!
 //! ```no_run
-//! use nanocodex_agent::{Nanocodex, OpenAi, Thinking};
-//! use nanocodex_eval::{Evaluator, Sweep, Task, VmResources};
+//! use std::time::Duration;
+//! use nanocodex_eval::{Evaluation, EvaluationClaim, EvaluationSelector};
 //!
 //! # async fn evaluate() -> Result<(), Box<dyn std::error::Error>> {
-//! let task = Task::load("tasks/write-greeting")?;
-//! let resources = VmResources::builder("target/debug/nanocodex", ".cache/vm/runtime.ext4")
-//!     .task(task.clone())
-//!     .prepare()
-//!     .await?;
-//! let backend = resources.backend().await?;
-//! let agent = Nanocodex::builder(OpenAi::new(std::env::var("OPENAI_API_KEY")?)?)
-//!     .instructions(
-//!         "Work directly in the provided workspace. Complete the requested \
-//!          task, verify your changes, and keep the final answer concise.",
-//!     )
-//!     .thinking(Thinking::Medium);
-//! let sweep = Sweep::builder()
-//!     .task(task)
-//!     .agent("gpt-5.6-sol-medium", agent.clone())?
-//!     .trials(5)
-//!     .build()?;
-//!
-//! let evaluator = Evaluator::builder(agent, backend)
-//!     .output_directory(".nanocodex/evals")
-//!     .max_concurrency(4)
-//!     .max_memory_mb(16_384)
-//!     .resume_incomplete(sweep)
-//!     .build()?;
-//! let run = evaluator.sweep();
-//! let mut stream = run.events().subscribe();
-//! let event_task = tokio::spawn(async move {
-//!     while let Some(event) = stream.recv().await? {
-//!         println!("{} {:?}", event.sequence, event.kind);
+//! let evaluation = Evaluation::open(
+//!     "nanocodex.toml",
+//!     "local-smoke",
+//!     ".nanocodex/evals",
+//! )?;
+//! let selector = EvaluationSelector::new("tasks/write-greeting");
+//! match evaluation.claim(&selector, Duration::from_secs(300))? {
+//!     EvaluationClaim::Prepare(claim) => {
+//!         // Prepare the immutable package exposed by `claim.task()`.
+//!         claim.complete()?;
 //!     }
-//!     Ok::<_, nanocodex_eval::EvalEventStreamError>(())
-//! });
-//!
-//! let results = run.await?;
-//! println!("{} attempts, {} skipped", results.attempts().len(), results.skipped());
-//! event_task.await??;
+//!     EvaluationClaim::Run(claim) => {
+//!         // Execute exactly this SQLite treatment and retain its evidence.
+//!         let evidence = claim.output_directory().to_path_buf();
+//!         claim.complete(&evidence)?;
+//!     }
+//!     EvaluationClaim::Busy(_) | EvaluationClaim::Complete => {}
+//! }
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! Every accepted attempt receives a fresh session and workspace. Results are
-//! independently awaitable from the optional event stream.
+//! Claims renew their own lease and expose only fenced completion or retry.
 
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]
 // Retained-data readers remain portable; VM execution internals become
@@ -65,62 +47,63 @@
     allow(dead_code, unused_imports)
 )]
 
-/// Aggregated metrics derived from retained evaluator outcomes.
-pub mod aggregate;
+mod api;
 /// Agent Trajectory Interchange Format projection and wire types.
 pub mod atif;
 mod capture_proxy;
-mod codex;
+pub mod coordinator;
+mod digest;
+mod evaluation;
+mod evaluator;
+mod event;
 #[cfg(any(
     all(target_os = "linux", not(target_env = "musl")),
     all(target_os = "macos", target_arch = "aarch64")
 ))]
-/// Matched Nanocodex-versus-Codex execution and retained comparison reports.
-pub mod differential;
-mod digest;
-mod durable;
-mod evaluator;
-mod event;
-pub mod harbor;
+/// Configured external harness execution inside evaluator-owned sandboxes.
+pub mod harness;
+mod harness_exec;
 mod job;
 mod native;
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "musl")),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+mod profile;
 mod result;
-mod sweep;
 mod task;
 #[cfg(any(
     all(target_os = "linux", not(target_env = "musl")),
     all(target_os = "macos", target_arch = "aarch64")
 ))]
 pub mod vm;
+mod workset;
 
-pub(crate) use aggregate::{
-    AggregateDataset, AttemptBuildIdentity, AttemptConfigurationIdentity, AttemptFact,
-    AttemptFactArtifacts, AttemptRuntimeMetrics, AttemptTaskIdentity, AttemptUsage,
-    AttemptVerifierFact, AttemptVerifierIdentity, LatencyBreakdown,
-};
 pub(crate) use atif::{
-    AtifAgent, AtifAgentExtra, AtifBuilder, AtifObservation, AtifObservationExtra,
-    AtifObservationResult, AtifSource, AtifStep, AtifToolCall, AtifToolCallExtra, AtifTrajectory,
+    AtifAgent, AtifAgentExtra, AtifObservation, AtifObservationExtra, AtifObservationResult,
+    AtifSource, AtifStep, AtifToolCall, AtifToolCallExtra, AtifTrajectory,
 };
-pub(crate) use capture_proxy::{
-    ResponsesCaptureProxy, ResponsesCaptureProxyConfig, ResponsesModelCatalogOverride,
-};
-pub(crate) use codex::{
-    CodexCommandOutput, CodexCommandRunner, CodexCommandRunnerError, CodexCommandStatus, CodexExec,
-    CodexExecError, project_codex_atif,
+pub(crate) use capture_proxy::{ResponsesCaptureProxy, ResponsesCaptureProxyConfig};
+pub use evaluation::{
+    CoordinateClaim, Evaluation, EvaluationBusy, EvaluationClaim, EvaluationCounts,
+    EvaluationError, EvaluationFamilyStatus, EvaluationSelector, EvaluationStatus,
+    EvaluationTreatment, EvaluationWork, PreparationClaim,
 };
 pub use evaluator::{EvalError, EvalRun, Evaluator, EvaluatorBuilder};
 pub use event::{
     EvalEvent, EvalEventAttempt, EvalEventKind, EvalEventStream, EvalEventStreamError, EvalEvents,
 };
+pub(crate) use harness_exec::{
+    HarnessCommandOutput, HarnessCommandRunner, HarnessCommandRunnerError, HarnessCommandStatus,
+    HarnessExec, HarnessExecError,
+};
+pub use profile::ResolvedHarness;
 pub use result::{
     AgentMetadata, AgentResult, AgentStatus, BillingCompleteness, CleanupDiagnostic, CleanupPhase,
     CleanupStatus, EvalArtifacts, EvalAttemptOutcome, EvalCleanup, EvalEnvironment, EvalException,
     EvalExceptionKind, EvalFailure, EvalFailureTiming, EvalOutcome, EvalResult, EvalStatus,
-    EvalTiming, MeasurementCompleteness, PhaseTiming, SweepAttemptResult, SweepResults,
-    UsageTotals, VerifierResult,
+    EvalTiming, MeasurementCompleteness, PhaseTiming, UsageTotals, VerifierResult,
 };
-pub use sweep::{AgentId, AgentIdError, Sweep, SweepBuilder, SweepError};
 pub use task::{
     NetworkPolicy, OciImage, Resources, Task, TaskLoadError, Verifier, VerifierCollect,
     VerifierEnvironmentMode,

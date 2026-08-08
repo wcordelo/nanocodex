@@ -36,6 +36,31 @@ fn eval_guest_memory_cap_only_reduces_large_task_allocations() {
     );
 }
 
+#[test]
+fn guest_executables_are_installed_by_the_task_image_recipe() {
+    let context = tempfile::tempdir().unwrap();
+    fs::write(context.path().join("Dockerfile"), "FROM ubuntu:24.04\n").unwrap();
+    let binary = context.path().join("codex");
+    fs::write(&binary, b"codex-binary").unwrap();
+
+    let installed = materialize_guest_executables(
+        context.path(),
+        &[VmGuestExecutable {
+            source: binary,
+            guest_path: "/usr/local/bin/codex".to_owned(),
+        }],
+    )
+    .unwrap();
+
+    assert_eq!(installed, 12);
+    assert_eq!(
+        fs::read_to_string(context.path().join("Dockerfile")).unwrap(),
+        "FROM ubuntu:24.04\n\nCOPY .nanocodex/guest-executables/0 /usr/local/bin/codex\n"
+    );
+    let staged = context.path().join(".nanocodex/guest-executables/0");
+    assert_eq!(fs::read(staged).unwrap(), b"codex-binary");
+}
+
 #[tokio::test]
 async fn vm_resources_leave_task_environments_lazy_and_single_flight() {
     let task =
@@ -472,7 +497,6 @@ fn verifier_with_launch_root(root: VmLaunchRoot, retain_failed_rootfs: bool) -> 
         retain_passed_rootfs: false,
         retain_failed_rootfs,
         root_disks_finalized: false,
-        memory: VmAttemptMemory::default(),
         _network: None,
     }
 }
@@ -783,7 +807,6 @@ done
         retain_passed_rootfs: false,
         retain_failed_rootfs: true,
         root_disks_finalized: false,
-        memory: VmAttemptMemory::default(),
         _network: None,
     };
 
