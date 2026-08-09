@@ -763,11 +763,11 @@ async fn shutdown_runtime(
     browser: Option<crate::browser::ConfiguredBrowser>,
     vm: Option<crate::vm::ConfiguredVm>,
 ) -> Result<()> {
-    worker.abort();
-    let worker_result = worker.await;
     if let Some(child_agents) = child_agents {
         child_agents.shutdown().await;
     }
+    worker.abort();
+    let worker_result = worker.await;
     let browser_shutdown_result = if let Some(browser) = browser {
         browser.shutdown().await
     } else {
@@ -2787,8 +2787,6 @@ fn classify_submission(input: impl Into<SubmittedPrompt>) -> Submission {
         }
         let instruction = crate::benchmark::prompt(
             argument,
-            std::path::Path::new("nanocodex.toml"),
-            None,
             None,
             None,
             None,
