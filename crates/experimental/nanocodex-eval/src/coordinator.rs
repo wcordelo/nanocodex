@@ -170,6 +170,10 @@ enum FinishRequest {
         error: String,
         evidence: Option<String>,
     },
+    Retry {
+        error: String,
+        evidence: Option<String>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -192,9 +196,6 @@ impl WorkerName {
         }
     }
 }
-
-#[derive(Deserialize)]
-struct WorkersInterruptedRequest {}
 
 #[derive(Serialize)]
 struct ErrorBody<'a> {
@@ -263,7 +264,6 @@ impl CoordinatorServer {
             .route("/v1/claims/{token}/artifacts", put(upload_artifacts))
             .route("/v1/claims/{token}/finish", post(finish))
             .route("/v1/workers/exited", post(worker_exited))
-            .route("/v1/workers/interrupted", post(workers_interrupted))
             .with_state(self.state);
         let result = axum::serve(
             listener,
@@ -426,23 +426,7 @@ impl CoordinatorClient {
         .await
     }
 
-    /// Releases the one-shot negative edge produced when the benchmark owner
-    /// restarts after its process group has been terminated.
-    ///
-    /// This is intentionally not a liveness protocol: the benchmark calls it
-    /// once at startup before admitting replacement workers.
-    pub async fn workers_interrupted(&self, error: &str) -> Result<(), CoordinatorError> {
-        accepted(
-            self.http
-                .post(self.endpoint("v1/workers/interrupted")?)
-                .json(&serde_json::json!({ "error": error }))
-                .send()
-                .await?,
-        )
-        .await
-    }
-
-    /// Records a terminal evaluation failure for one running task row.
+    /// Records a verifier-failing result for one running task row.
     pub async fn fail(&self, claim: &RemoteTaskClaim, error: &str) -> Result<(), CoordinatorError> {
         self.finish(
             claim,
@@ -451,7 +435,7 @@ impl CoordinatorClient {
         .await
     }
 
-    /// Uploads retained evidence and records a terminal failure.
+    /// Uploads retained evidence and records a verifier-failing result.
     pub async fn fail_with_evidence(
         &self,
         claim: &RemoteTaskClaim,
@@ -467,6 +451,42 @@ impl CoordinatorClient {
             claim,
             serde_json::json!({
                 "outcome": "failed",
+                "error": error,
+                "evidence": evidence.to_string_lossy(),
+            }),
+        )
+        .await
+    }
+
+    /// Records an infrastructure-failed attempt and makes its row claimable again.
+    pub async fn retry(
+        &self,
+        claim: &RemoteTaskClaim,
+        error: &str,
+    ) -> Result<(), CoordinatorError> {
+        self.finish(
+            claim,
+            serde_json::json!({ "outcome": "retry", "error": error }),
+        )
+        .await
+    }
+
+    /// Uploads infrastructure-failure evidence before making the row claimable again.
+    pub async fn retry_with_evidence(
+        &self,
+        claim: &RemoteTaskClaim,
+        output_directory: &Path,
+        evidence: &Path,
+        error: &str,
+    ) -> Result<(), CoordinatorError> {
+        let evidence = evidence
+            .strip_prefix(output_directory)
+            .map_err(|_| CoordinatorError::EvidencePath)?;
+        self.upload(claim, output_directory).await?;
+        self.finish(
+            claim,
+            serde_json::json!({
+                "outcome": "retry",
                 "error": error,
                 "evidence": evidence.to_string_lossy(),
             }),
@@ -698,20 +718,6 @@ async fn worker_exited(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn workers_interrupted(
-    State(state): State<CoordinatorState>,
-    Json(_request): Json<WorkersInterruptedRequest>,
-) -> Result<StatusCode, ApiError> {
-    let interrupted = {
-        let mut active = state.active.lock().await;
-        active.drain().map(|(_, claim)| claim).collect::<Vec<_>>()
-    };
-    for active in interrupted {
-        active.claim.release().map_err(ApiError::ledger)?;
-    }
-    Ok(StatusCode::NO_CONTENT)
-}
-
 async fn upload_artifacts(
     State(state): State<CoordinatorState>,
     AxumPath(token): AxumPath<String>,
@@ -759,6 +765,19 @@ async fn finish(
             active
                 .claim
                 .fail(evidence.as_deref(), &error)
+                .map_err(ApiError::ledger)?;
+        }
+        FinishRequest::Retry { error, evidence } => {
+            let evidence = evidence
+                .as_deref()
+                .map(|evidence| safe_evidence(active.claim.output_directory(), evidence))
+                .transpose()?;
+            if evidence.as_ref().is_some_and(|evidence| !evidence.exists()) {
+                return Err(ApiError::bad_request("failure evidence was not uploaded"));
+            }
+            active
+                .claim
+                .retry(evidence.as_deref(), &error)
                 .map_err(ApiError::ledger)?;
         }
     }
@@ -1068,6 +1087,7 @@ impl TryFrom<WireTreatment> for EvaluationTreatment {
 mod tests {
     use std::{fs, path::Path};
 
+    use rusqlite::Connection;
     use tokio::task::JoinHandle;
 
     use super::*;
@@ -1219,7 +1239,10 @@ thinking = ["high"]
             fs::write(output.join("vm/config.json"), "{}\n").unwrap();
             client.succeed(claim, &output, &evidence).await.unwrap();
         }
-        assert!(!stale_marker.exists());
+        assert!(
+            stale_marker.exists(),
+            "one attempt must not erase sibling evidence"
+        );
 
         let status = client.status().await.unwrap();
         assert_eq!(status["tasks"]["success"], 2);
@@ -1413,32 +1436,44 @@ thinking = ["high"]
     }
 
     #[tokio::test]
-    async fn benchmark_restart_releases_every_interrupted_worker_once() {
-        let (_directory, client, selection, server) = fixture().await;
+    async fn infrastructure_failure_requeues_the_same_coordinate() {
+        let (directory, client, selection, server) = fixture().await;
         let first = client.clone().worker("first-worker");
-        let second = client.clone().worker("second-worker");
-        assert!(matches!(
-            first.claim(&selection).await.unwrap(),
-            RemoteClaim::Run { .. }
-        ));
-        assert!(matches!(
-            second.claim(&selection).await.unwrap(),
-            RemoteClaim::Run { .. }
-        ));
-
-        client
-            .workers_interrupted("benchmark process group exited")
-            .await
-            .unwrap();
-        client
-            .workers_interrupted("duplicate restart observation")
-            .await
-            .unwrap();
+        let RemoteClaim::Run {
+            claim, repetition, ..
+        } = first.claim(&selection).await.unwrap()
+        else {
+            panic!("first worker should run");
+        };
+        first.retry(&claim, "provider returned 429").await.unwrap();
 
         let status = client.status().await.unwrap();
-        assert_eq!(status["tasks"]["running"], 0);
-        assert_eq!(status["tasks"]["failed"], 0);
         assert_eq!(status["tasks"]["unclaimed"], 2);
+        assert_eq!(status["tasks"]["failed"], 0);
+        let replacement = client.clone().worker("replacement-worker");
+        let RemoteClaim::Run {
+            repetition: replacement_repetition,
+            ..
+        } = replacement.claim(&selection).await.unwrap()
+        else {
+            panic!("infrastructure-failed coordinate should be claimable");
+        };
+        assert_eq!(replacement_repetition, repetition);
+        let connection = Connection::open(directory.path().join("state/state.sqlite3")).unwrap();
+        let attempt: (String, String) = connection
+            .query_row(
+                "SELECT state, error FROM eval_attempts ORDER BY id LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            attempt,
+            (
+                "infrastructure_failed".to_owned(),
+                "provider returned 429".to_owned()
+            )
+        );
         server.abort();
     }
 

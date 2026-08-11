@@ -27,6 +27,16 @@
   concrete need in the current slice.
 - Add focused deterministic tests for public contracts and demonstrated
   regressions, not for coverage. Compile public examples as part of validation.
+- Do not add or run CLI tests that assert benchmark-orchestrator prompt wording
+  or scheduling policy. Every change to benchmark orchestration or saturation
+  policy must be built, deployed, and exercised against the real coordinator
+  and benchmark host before handoff. Record the observed worker-count ramp,
+  task counts, memory, load, and pressure; never claim success from prompt
+  inspection or synthetic tests alone. During that validation, do not manually
+  kill or shed eval workers: the OS owns resource-exhaustion deaths, and the
+  benchmark controller must observe, classify, and adapt without an operator.
+  Keep automated tests for executable protocol, parsing, and durable-state
+  contracts.
 - Use `just run` for a live native smoke. Use focused Harbor trials while
   iterating and the full configured `just eval` only for milestone/release
   gates. Never modify benchmark tasks or verifiers to make Nanocodex pass.
@@ -34,6 +44,23 @@
   eval claim. Separate cold image/bootstrap time from warm agent work.
 - Preserve unrelated work. Never commit `.env`, caches, retained jobs, build
   output, or another user's untracked files.
+
+## Experimental eval iteration
+
+- Treat eval ledgers, coordinator state, retained benchmark artifacts, and
+  their schemas as experimental development state, not a compatibility
+  boundary. Evolve the canonical format directly as the benchmark system
+  changes.
+- Do not add backward-compatible readers, dual-write paths, legacy schema
+  support, or compatibility shims unless the user explicitly asks for them.
+  Use a direct one-way migration for the active corpus when its data remains
+  useful; otherwise recreate or reseed the experimental state in the new
+  format.
+- Do not pause routine eval iteration or deployment to make backup copies of
+  experimental benchmark state. Make a backup only when the user explicitly
+  requests one.
+- Once active state has moved to the new format, remove obsolete format and
+  migration code instead of retaining permanent compatibility machinery.
 
 ## Codex reference
 

@@ -1,10 +1,16 @@
-use std::path::{Path, PathBuf};
+use std::{
+    fs::{self, OpenOptions},
+    io,
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime},
+};
 
 use clap::Args;
 use eyre::{Result, WrapErr as _, eyre};
+use fs2::FileExt as _;
 use nanocodex::{Model, Thinking};
 use nanocodex_eval::{
-    EvalAttemptOutcome, EvalEventKind, EvalEventStream, EvalOutcome, Evaluation, EvaluationClaim,
+    EvalAttemptOutcome, EvalEventKind, EvalEventStream, EvalStatus, Evaluation, EvaluationClaim,
     EvaluationSelector, EvaluationWork, Evaluator, ResolvedHarness, Task,
     atif::AtifBuilder,
     coordinator::{CoordinatorClient, RemoteClaim},
@@ -21,6 +27,8 @@ use crate::{
 };
 
 const CONFIG_FILE: &str = "nanocodex.toml";
+const WORKER_DIRECTORY_PREFIX: &str = "nanocodex-eval-worker-";
+const ABANDONED_WORKER_AGE: Duration = Duration::from_secs(2 * 60 * 60);
 
 #[derive(Clone, Debug, Args)]
 pub(super) struct ProfileTarget {
@@ -134,8 +142,9 @@ enum RunOutput<'a> {
         task: &'a str,
         repetition: u16,
         evidence: &'a str,
+        status: &'a str,
     },
-    Failed {
+    InfrastructureFailed {
         profile: &'a str,
         task: &'a str,
         repetition: u16,
@@ -309,40 +318,47 @@ impl Run {
                 }
                 .await;
                 match result {
-                    Ok(ExecutionResult::Success(evidence)) => {
-                        claim.succeed(&evidence)?;
+                    Ok(ExecutionResult::Completed { status, evidence }) => {
+                        let status_name = eval_status_name(status);
+                        match status {
+                            EvalStatus::Passed => claim.succeed(&evidence)?,
+                            EvalStatus::Failed => {
+                                claim.fail(Some(&evidence), "verifier returned a failing score")?
+                            }
+                        }
                         let evidence = evidence.to_string_lossy();
                         write_json(&RunOutput::Completed {
                             profile: evaluation.name(),
                             task: &task_selector,
                             repetition,
                             evidence: &evidence,
+                            status: status_name,
                         })?;
                         Ok(())
                     }
-                    Ok(ExecutionResult::Failed { error, evidence }) => {
-                        claim.fail(Some(&evidence), &error)?;
-                        write_json(&RunOutput::Failed {
+                    Ok(ExecutionResult::InfrastructureFailed { error, evidence }) => {
+                        claim.retry(Some(&evidence), &error)?;
+                        write_json(&RunOutput::InfrastructureFailed {
                             profile: evaluation.name(),
                             task: &task_selector,
                             repetition,
                             error: &error,
                         })?;
                         Err(eyre!(
-                            "task failed permanently; evidence retained at {}: {error}",
+                            "task infrastructure failed; evidence retained at {} and row requeued: {error}",
                             evidence.display()
                         ))
                     }
                     Err(error) => {
                         let message = format!("{error:#}");
-                        claim.fail(None, &message)?;
-                        write_json(&RunOutput::Failed {
+                        claim.retry(None, &message)?;
+                        write_json(&RunOutput::InfrastructureFailed {
                             profile: evaluation.name(),
                             task: &task_selector,
                             repetition,
                             error: &message,
                         })?;
-                        Err(error).wrap_err("task failed permanently")
+                        Err(error).wrap_err("task infrastructure failed and row was requeued")
                     }
                 }
             }
@@ -395,18 +411,26 @@ async fn run_remote(
                 let harness = Evaluation::resolve_harness(config, &treatment.harness)?;
                 let harnesses = harness.iter().cloned().collect::<Vec<_>>();
                 let host = run::PreparedVmHost::open()?;
+                reap_abandoned_worker_directories(host.cache())?;
                 let output = tempfile::Builder::new()
-                    .prefix("nanocodex-eval-worker-")
+                    .prefix(WORKER_DIRECTORY_PREFIX)
                     .tempdir_in(host.cache())?;
-                Ok::<_, eyre::Report>((task, harness, harnesses, host, output))
+                let output_lease = OpenOptions::new()
+                    .create(true)
+                    .read(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(output.path().join(".active.lock"))?;
+                output_lease.lock_exclusive()?;
+                Ok::<_, eyre::Report>((task, harness, harnesses, host, output, output_lease))
             })();
-            let (task, harness, harnesses, host, output) = match setup {
+            let (task, harness, harnesses, host, output, _output_lease) = match setup {
                 Ok(setup) => setup,
                 Err(error) => {
                     let detail = format!("{error:#}");
-                    let finish = coordinator.fail(&claim, &detail).await;
+                    let finish = coordinator.retry(&claim, &detail).await;
                     finish?;
-                    return Err(error).wrap_err("remote task setup failed permanently");
+                    return Err(error).wrap_err("remote task setup failed and row was requeued");
                 }
             };
             let execution = async {
@@ -424,33 +448,50 @@ async fn run_remote(
             };
             let result = execution.await;
             match result {
-                Ok(ExecutionResult::Success(evidence)) => {
-                    let finish = coordinator.succeed(&claim, output.path(), &evidence).await;
+                Ok(ExecutionResult::Completed { status, evidence }) => {
+                    let finish = match status {
+                        EvalStatus::Passed => {
+                            coordinator.succeed(&claim, output.path(), &evidence).await
+                        }
+                        EvalStatus::Failed => {
+                            coordinator
+                                .fail_with_evidence(
+                                    &claim,
+                                    output.path(),
+                                    &evidence,
+                                    "verifier returned a failing score",
+                                )
+                                .await
+                        }
+                    };
                     finish?;
                     write_json(&RunOutput::Completed {
                         profile,
                         task: &task_selector,
                         repetition,
                         evidence: "coordinator",
+                        status: eval_status_name(status),
                     })?;
                     Ok(())
                 }
-                Ok(ExecutionResult::Failed { error, evidence }) => {
+                Ok(ExecutionResult::InfrastructureFailed { error, evidence }) => {
                     let finish = coordinator
-                        .fail_with_evidence(&claim, output.path(), &evidence, &error)
+                        .retry_with_evidence(&claim, output.path(), &evidence, &error)
                         .await;
                     finish?;
-                    write_json(&RunOutput::Failed {
+                    write_json(&RunOutput::InfrastructureFailed {
                         profile,
                         task: &task_selector,
                         repetition,
                         error: &error,
                     })?;
-                    Err(eyre!("remote task failed permanently: {error}"))
+                    Err(eyre!(
+                        "remote task infrastructure failed and row was requeued: {error}"
+                    ))
                 }
                 Err(error) => {
                     let finish = coordinator
-                        .fail_with_evidence(
+                        .retry_with_evidence(
                             &claim,
                             output.path(),
                             output.path(),
@@ -458,7 +499,7 @@ async fn run_remote(
                         )
                         .await;
                     finish?;
-                    Err(error).wrap_err("remote task failed permanently")
+                    Err(error).wrap_err("remote task infrastructure failed and row was requeued")
                 }
             }
         }
@@ -486,6 +527,78 @@ async fn run_remote(
     }
 }
 
+fn reap_abandoned_worker_directories(cache: &Path) -> Result<()> {
+    let now = SystemTime::now();
+    let mut removed = 0_u64;
+    for entry in fs::read_dir(cache)
+        .wrap_err_with(|| format!("failed to inspect VM cache {}", cache.display()))?
+    {
+        let entry = entry?;
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(WORKER_DIRECTORY_PREFIX)
+            || !entry.file_type()?.is_dir()
+        {
+            continue;
+        }
+        let modified = entry.metadata()?.modified()?;
+        if now.duration_since(modified).unwrap_or_default() < ABANDONED_WORKER_AGE {
+            continue;
+        }
+        let directory = entry.path();
+        let lease = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(directory.join(".active.lock"))
+        {
+            Ok(lease) => Some(lease),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => {
+                tracing::warn!(
+                    target: "nanocodex_eval",
+                    worker_directory = %directory.display(),
+                    %error,
+                    "failed to inspect stale eval worker lease"
+                );
+                continue;
+            }
+        };
+        if let Some(lease) = &lease
+            && let Err(error) = lease.try_lock_exclusive()
+        {
+            if error.kind() != io::ErrorKind::WouldBlock {
+                tracing::warn!(
+                    target: "nanocodex_eval",
+                    worker_directory = %directory.display(),
+                    %error,
+                    "failed to lock stale eval worker directory"
+                );
+            }
+            continue;
+        }
+        match fs::remove_dir_all(&directory) {
+            Ok(()) => removed = removed.saturating_add(1),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                target: "nanocodex_eval",
+                worker_directory = %directory.display(),
+                %error,
+                "failed to remove abandoned eval worker directory"
+            ),
+        }
+    }
+    if removed > 0 {
+        tracing::info!(
+            target: "nanocodex_eval",
+            removed,
+            cache = %cache.display(),
+            "removed abandoned eval worker directories"
+        );
+    }
+    Ok(())
+}
+
 fn validate_web_search(agent: &EvalAgentArgs, profile: &str, web_search: bool) -> Result<()> {
     if agent
         .web_search()
@@ -510,8 +623,37 @@ impl ProfileTarget {
 }
 
 enum ExecutionResult {
-    Success(PathBuf),
-    Failed { error: String, evidence: PathBuf },
+    Completed {
+        status: EvalStatus,
+        evidence: PathBuf,
+    },
+    InfrastructureFailed {
+        error: String,
+        evidence: PathBuf,
+    },
+}
+
+const fn eval_status_name(status: EvalStatus) -> &'static str {
+    match status {
+        EvalStatus::Passed => "passed",
+        EvalStatus::Failed => "failed",
+    }
+}
+
+fn classify_execution(outcome: &EvalAttemptOutcome, evidence: PathBuf) -> ExecutionResult {
+    match outcome.scored() {
+        Some(result) => ExecutionResult::Completed {
+            status: result.status,
+            evidence,
+        },
+        None => ExecutionResult::InfrastructureFailed {
+            error: outcome.unscored().map_or_else(
+                || "evaluation attempt was not scored".to_owned(),
+                |failure| failure.traceback().to_owned(),
+            ),
+            evidence,
+        },
+    }
 }
 
 async fn prepare_resources(task: &Task, harnesses: &[ResolvedHarness]) -> Result<VmResources> {
@@ -563,14 +705,7 @@ async fn execute_coordinate(
                 .build()?;
             let outcome = run_native(&evaluator, task).await?;
             let evidence = evaluator.directory().to_path_buf();
-            if outcome.outcome() == EvalOutcome::InfrastructureError {
-                Ok(ExecutionResult::Failed {
-                    error: "native evaluator retained an infrastructure failure".to_owned(),
-                    evidence,
-                })
-            } else {
-                Ok(ExecutionResult::Success(evidence))
-            }
+            Ok(classify_execution(&outcome, evidence))
         }
         _ => {
             let (nanocodex, auth) =
@@ -609,14 +744,7 @@ async fn execute_coordinate(
             let outcome = run_native(harness.evaluator(), task).await?;
             harness.retain_trajectory(&outcome).await?;
             let evidence = harness.directory().to_path_buf();
-            if outcome.outcome() == EvalOutcome::InfrastructureError {
-                Ok(ExecutionResult::Failed {
-                    error: "external harness retained an infrastructure failure".to_owned(),
-                    evidence,
-                })
-            } else {
-                Ok(ExecutionResult::Success(evidence))
-            }
+            Ok(classify_execution(&outcome, evidence))
         }
     }
 }
