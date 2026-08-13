@@ -115,7 +115,7 @@ where
                 orchestration: ModelConfig::orchestration(),
                 websocket_url: display_endpoint(self.responses_endpoint()),
                 workspace,
-                instruction_bytes: task.instruction.text_bytes(),
+                instruction_bytes: task.text_bytes(),
             },
         )?;
         let error = NanocodexError::TurnCancelled;
@@ -170,7 +170,7 @@ where
                 orchestration: ModelConfig::orchestration(),
                 websocket_url: display_endpoint(self.responses_endpoint()),
                 workspace: workspace.as_deref(),
-                instruction_bytes: task.instruction.text_bytes(),
+                instruction_bytes: task.text_bytes(),
             },
         )?;
 
@@ -329,7 +329,7 @@ where
             let user_content = prepare_user_input(&task.instruction).await;
             session
                 .conversation
-                .append([ResponseItem::message(MessageRole::User, user_content)]);
+                .append(prompt_messages(task, user_content));
             return Ok(false);
         };
         if compacted || session.preserve_inherited_delta {
@@ -365,7 +365,7 @@ where
         let user_content = prepare_user_input(&task.instruction).await;
         session
             .conversation
-            .append([ResponseItem::message(MessageRole::User, user_content)]);
+            .append(prompt_messages(task, user_content));
         Ok(true)
     }
 
@@ -426,13 +426,9 @@ where
                 tools.default_shell_name(),
                 self.context_source.execution_environment(),
             );
-            let mut history = task_input(user_content, &context_snapshot);
+            let mut history = task_input(&task, user_content, &context_snapshot);
             if !self.pending_developer_messages.is_empty() {
-                let user = history
-                    .pop()
-                    .expect("task input always ends with user input");
-                history.append(&mut self.pending_developer_messages);
-                history.push(user);
+                history.splice(2..2, self.pending_developer_messages.drain(..));
             }
             context.establish(context_snapshot);
             let conversation = ConversationState::new(history)?;
@@ -547,6 +543,7 @@ where
             } else {
                 format!("aborted by user after {:.1}s", elapsed_seconds.max(0.1))
             });
+            let structured_result = output.structured_result();
             self.finish_active_tool_progress(&call.progress);
             self.finish_cancelled_tool_work(&call);
             record_tool_span_terminal(&call.span, "cancelled", "ERROR", duration_ns, &output);
@@ -559,6 +556,7 @@ where
                     duration_ns,
                     started_after_ns: None,
                     result: &output,
+                    structured_result: &structured_result,
                     metadata: None,
                 },
             )?;
@@ -747,9 +745,9 @@ where
                     "turn content"
                 );
             }
-            let instruction_bytes = steer.instruction.text_bytes();
+            let instruction_bytes = steer.text_bytes();
             let user_content = prepare_user_input(&steer.instruction).await;
-            conversation.append([ResponseItem::message(MessageRole::User, user_content)]);
+            conversation.append(prompt_messages(&steer, user_content));
             self.stats.steers += 1;
             self.events.emit(
                 AgentEventKind::RunSteered,

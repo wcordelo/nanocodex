@@ -60,6 +60,8 @@ pub enum RemoteClaim {
         family_key: String,
         /// Task package selector retained in SQLite.
         task: String,
+        /// Canonical task package root retained by the coordinator host.
+        task_root: PathBuf,
         /// Exact treatment retained in SQLite.
         treatment: EvaluationTreatment,
     },
@@ -119,6 +121,7 @@ struct CoordinatorState {
     evaluation: Evaluation,
     eval_api: EvalApi,
     active: Arc<Mutex<HashMap<String, ActiveClaim>>>,
+    ledger_writes: Arc<Mutex<()>>,
 }
 
 struct ActiveClaim {
@@ -151,6 +154,7 @@ enum ClaimResponse {
         repetition: u16,
         family_key: String,
         task: String,
+        task_root: PathBuf,
         treatment: WireTreatment,
     },
     Busy {
@@ -223,6 +227,7 @@ impl CoordinatorServer {
                 evaluation,
                 eval_api,
                 active: Arc::new(Mutex::new(HashMap::new())),
+                ledger_writes: Arc::new(Mutex::new(())),
             },
         }
     }
@@ -252,8 +257,16 @@ impl CoordinatorServer {
             .route("/v1/evals", get(eval_overview))
             .route("/v1/evals/worksets/{digest}", get(eval_workset))
             .route(
+                "/v1/evals/worksets/{digest}/analytics",
+                get(eval_workset_analytics),
+            )
+            .route(
                 "/v1/evals/worksets/{digest}/tasks/{task_id}",
                 get(eval_task),
+            )
+            .route(
+                "/v1/evals/worksets/{digest}/tasks/{task_id}/results",
+                get(eval_task_results),
             )
             .route(
                 "/v1/evals/worksets/{digest}/tasks/{task_id}/outcomes",
@@ -298,6 +311,7 @@ impl CoordinatorClient {
         if !base.path().ends_with('/') {
             base.set_path(&format!("{}/", base.path()));
         }
+        nanocodex_oai_api::transport::install_default_rustls_crypto_provider();
         Ok(Self {
             base,
             http: reqwest::Client::builder()
@@ -348,12 +362,14 @@ impl CoordinatorClient {
                 repetition,
                 family_key,
                 task,
+                task_root,
                 treatment,
             } => RemoteClaim::Run {
                 claim: RemoteTaskClaim { token: claim },
                 repetition,
                 family_key,
                 task,
+                task_root,
                 treatment: treatment.try_into()?,
             },
             ClaimResponse::Busy {
@@ -385,12 +401,14 @@ impl CoordinatorClient {
                 repetition,
                 family_key,
                 task,
+                task_root,
                 treatment,
             } => RemoteClaim::Run {
                 claim: RemoteTaskClaim { token: claim },
                 repetition,
                 family_key,
                 task,
+                task_root,
                 treatment: treatment.try_into()?,
             },
             ClaimResponse::Busy {
@@ -562,7 +580,11 @@ impl CoordinatorClient {
 async fn status(
     State(state): State<CoordinatorState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let status = state.evaluation.status().map_err(ApiError::ledger)?;
+    let evaluation = state.evaluation;
+    let status = tokio::task::spawn_blocking(move || evaluation.status())
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::ledger)?;
     Ok(Json(
         serde_json::to_value(status).map_err(ApiError::internal)?,
     ))
@@ -589,6 +611,34 @@ async fn eval_workset(
     workset
         .map(|workset| Json(workset).into_response())
         .ok_or_else(|| ApiError::not_found("evaluation workset was not found"))
+}
+
+async fn eval_workset_analytics(
+    State(state): State<CoordinatorState>,
+    AxumPath(digest): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    let api = state.eval_api;
+    let analytics = tokio::task::spawn_blocking(move || api.workset_analytics(&digest))
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::internal)?;
+    analytics
+        .map(|analytics| Json(analytics).into_response())
+        .ok_or_else(|| ApiError::not_found("evaluation workset was not found"))
+}
+
+async fn eval_task_results(
+    State(state): State<CoordinatorState>,
+    AxumPath((digest, task_id)): AxumPath<(String, String)>,
+) -> Result<Response, ApiError> {
+    let api = state.eval_api;
+    let results = tokio::task::spawn_blocking(move || api.task_results(&digest, &task_id))
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::internal)?;
+    results
+        .map(|results| Json(results).into_response())
+        .ok_or_else(|| ApiError::not_found("evaluation task was not found"))
 }
 
 async fn eval_case(
@@ -649,7 +699,7 @@ async fn claim(
         .worker
         .filter(|worker| !worker.trim().is_empty())
         .unwrap_or_else(|| peer.ip().to_string());
-    let claim = match request.task {
+    let selector = match request.task {
         Some(task) => {
             let model = request
                 .model
@@ -663,16 +713,26 @@ async fn claim(
                 .harness(request.harness)
                 .model(model)
                 .thinking(thinking);
-            state.evaluation.claim_for_worker(&selector, &host)
+            Some(selector)
         }
-        None => state.evaluation.claim_next_for_worker(&host),
-    }
+        None => None,
+    };
+    let _write = state.ledger_writes.lock().await;
+    let evaluation = state.evaluation.clone();
+    let claim_host = host.clone();
+    let claim = tokio::task::spawn_blocking(move || match selector {
+        Some(selector) => evaluation.claim_for_worker(&selector, &claim_host),
+        None => evaluation.claim_next_for_worker(&claim_host),
+    })
+    .await
+    .map_err(ApiError::internal)?
     .map_err(ApiError::bad_gateway)?;
     let response = match claim {
         EvaluationClaim::Run(claim) => {
             let repetition = claim.repetition();
             let family_key = claim.family_key().to_owned();
             let task = claim.task_selector().to_owned();
+            let task_root = claim.task().root().to_path_buf();
             let treatment = WireTreatment::from(claim.treatment());
             let claim = insert_claim(&state, claim, host).await;
             ClaimResponse::Run {
@@ -680,6 +740,7 @@ async fn claim(
                 repetition,
                 family_key,
                 task,
+                task_root,
                 treatment,
             }
         }
@@ -700,6 +761,7 @@ async fn worker_exited(
     if worker.trim().is_empty() {
         return Err(ApiError::bad_request("worker name must not be empty"));
     }
+    let _write = state.ledger_writes.lock().await;
     let exited = {
         let mut active = state.active.lock().await;
         let tokens = active
@@ -712,9 +774,14 @@ async fn worker_exited(
             .filter_map(|token| active.remove(&token))
             .collect::<Vec<_>>()
     };
-    for active in exited {
-        active.claim.release().map_err(ApiError::ledger)?;
-    }
+    tokio::task::spawn_blocking(move || {
+        for active in exited {
+            active.claim.release().map_err(ApiError::ledger)?;
+        }
+        Ok::<_, ApiError>(())
+    })
+    .await
+    .map_err(ApiError::internal)??;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -739,12 +806,25 @@ async fn finish(
     AxumPath(token): AxumPath<String>,
     Json(request): Json<FinishRequest>,
 ) -> Result<StatusCode, ApiError> {
+    let _write = state.ledger_writes.lock().await;
     let active = state
         .active
         .lock()
         .await
         .remove(&token)
         .ok_or_else(|| ApiError::not_found("claim is absent or expired"))?;
+    let eval_api = state.eval_api.clone();
+    tokio::task::spawn_blocking(move || finish_claim(active, request, &eval_api))
+        .await
+        .map_err(ApiError::internal)??;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn finish_claim(
+    active: ActiveClaim,
+    request: FinishRequest,
+    eval_api: &EvalApi,
+) -> Result<(), ApiError> {
     match request {
         FinishRequest::Success { evidence } => {
             let claim = active.claim;
@@ -753,6 +833,9 @@ async fn finish(
                 return Err(ApiError::bad_request("accepted evidence was not uploaded"));
             }
             claim.succeed(&evidence).map_err(ApiError::ledger)?;
+            if let Err(error) = eval_api.index_result(&evidence) {
+                tracing::warn!(%error, "failed to index accepted evaluation result");
+            }
         }
         FinishRequest::Failed { error, evidence } => {
             let evidence = evidence
@@ -766,6 +849,11 @@ async fn finish(
                 .claim
                 .fail(evidence.as_deref(), &error)
                 .map_err(ApiError::ledger)?;
+            if let Some(evidence) = evidence
+                && let Err(error) = eval_api.index_result(&evidence)
+            {
+                tracing::warn!(%error, "failed to index accepted evaluation result");
+            }
         }
         FinishRequest::Retry { error, evidence } => {
             let evidence = evidence
@@ -781,7 +869,7 @@ async fn finish(
                 .map_err(ApiError::ledger)?;
         }
     }
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
 }
 
 async fn insert_claim(state: &CoordinatorState, claim: CoordinateClaim, worker: String) -> String {
@@ -1181,6 +1269,7 @@ thinking = ["high"]
             claim: first_claim,
             repetition: first_repetition,
             family_key: first_family_key,
+            task_root: first_task_root,
             ..
         } = first.unwrap()
         else {
@@ -1195,6 +1284,10 @@ thinking = ["high"]
             panic!("second worker should run");
         };
         assert_ne!(first_repetition, second_repetition);
+        assert_eq!(
+            first_task_root,
+            fs::canonicalize(directory.path().join("one")).unwrap()
+        );
 
         let status = client.status().await.unwrap();
         let profile_digest = status["digest"].as_str().unwrap();
@@ -1224,7 +1317,7 @@ thinking = ["high"]
             fs::write(
                 output.join("events.jsonl"),
                 "{\"type\":\"attempt_started\",\"payload\":{\"prompt\":\"do it\"},\"attempt\":{\"task_name\":\"one\"}}\n\
-                 {\"type\":\"completed\",\"payload\":{\"task_name\":\"one\",\"status\":\"passed\",\"outcome\":\"passed\",\"environment\":\"micro_vm\",\"agent\":{\"model\":\"sol\",\"effort\":\"high\",\"tool_calls\":1,\"usage\":{\"total_tokens\":10}},\"verifier\":{\"exit_code\":0,\"rewards\":{\"reward\":1}}}}\n",
+                 {\"type\":\"completed\",\"payload\":{\"task_name\":\"one\",\"status\":\"passed\",\"outcome\":\"passed\",\"environment\":\"micro_vm\",\"agent\":{\"model\":\"sol\",\"effort\":\"high\",\"tool_calls\":1,\"cost_usd\":\"0.042\",\"usage\":{\"input_tokens\":7,\"cached_input_tokens\":3,\"output_tokens\":3,\"reasoning_output_tokens\":2,\"total_tokens\":10}},\"verifier\":{\"exit_code\":0,\"rewards\":{\"reward\":1}}}}\n",
             )
             .unwrap();
             fs::write(
@@ -1297,7 +1390,48 @@ thinking = ["high"]
                 .len(),
             2
         );
-        assert!(task["task"]["treatments"][0]["cells"][0]["status"].is_null());
+        assert_eq!(
+            task["task"]["treatments"][0]["cells"][0]["status"],
+            "passed"
+        );
+        let analytics: serde_json::Value = decode(
+            client
+                .http
+                .get(
+                    client
+                        .endpoint(&format!("v1/evals/worksets/{digest}/analytics"))
+                        .unwrap(),
+                )
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(analytics["taskCount"], 1);
+        assert_eq!(analytics["points"].as_array().unwrap().len(), 1);
+        assert_eq!(analytics["points"][0]["passed"], 2);
+        assert_eq!(analytics["points"][0]["completed"], 2);
+        assert_eq!(analytics["points"][0]["medianOutputTokens"], 3.0);
+        assert_eq!(analytics["points"][0]["outputSamples"], 2);
+        assert_eq!(analytics["points"][0]["medianCostUsd"], 0.042);
+        let task_results: serde_json::Value = decode(
+            client
+                .http
+                .get(
+                    client
+                        .endpoint(&format!(
+                            "v1/evals/worksets/{digest}/tasks/{task_id}/results"
+                        ))
+                        .unwrap(),
+                )
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(task_results["points"].as_array().unwrap().len(), 2);
         assert_eq!(
             task["task"]["treatments"][0]["cells"][0]["state"],
             "success"

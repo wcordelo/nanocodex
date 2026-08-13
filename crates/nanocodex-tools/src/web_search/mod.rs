@@ -9,7 +9,7 @@ use nanocodex_oai_api::{
     tools::ToolDefinition,
 };
 use reqwest::header::{AUTHORIZATION, USER_AGENT};
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio::time::{sleep, timeout};
 
 use self::{
@@ -35,6 +35,7 @@ pub(super) struct WebSearchHandler {
 impl WebSearchHandler {
     #[cfg(test)]
     pub(super) fn new(config: WebSearchConfig) -> Self {
+        nanocodex_oai_api::transport::install_default_rustls_crypto_provider();
         Self::with_client(config, reqwest::Client::new())
     }
 
@@ -135,7 +136,7 @@ impl WebSearchHandler {
 
         let output = outputs.join("\n");
         let mut execution = if failures.is_empty() {
-            ToolOutput::text(output.clone()).with_code_mode_value(Value::String(output))
+            ToolOutput::text(output)
         } else {
             let mut error = failures.join("\n");
             if !output.is_empty() {

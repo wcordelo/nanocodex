@@ -8,14 +8,14 @@ use std::{
 
 use crate::{
     Task,
-    profile::{EvaluationManifest, ResolvedFamily, ResolvedHarness},
+    profile::{EvaluationManifest, ResolvedFamily, ResolvedHarness, ResolvedProfile, ResolvedTask},
     workset::{
         BeginTask, TaskClaim, Workset, WorksetBusy, WorksetError, WorksetFamily, WorksetObserver,
         WorksetStatus, WorksetTask,
     },
 };
 use nanocodex_oai_api::{Model, Thinking};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 const LEDGER_FILE: &str = "state.sqlite3";
@@ -98,19 +98,6 @@ pub struct EvaluationTreatment {
     pub web_search: bool,
 }
 
-#[derive(Deserialize, Serialize)]
-struct StoredTreatment {
-    #[serde(default)]
-    key: String,
-    #[serde(default)]
-    task: String,
-    harness: String,
-    model: Model,
-    thinking: String,
-    #[serde(default)]
-    web_search: bool,
-}
-
 /// Temporary inability to claim the selected family.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct EvaluationBusy {
@@ -129,6 +116,8 @@ pub struct EvaluationStatus {
     pub digest: String,
     /// Pre-materialized task-row counts.
     pub tasks: EvaluationCounts,
+    /// Stable names of workers that currently own running rows.
+    pub workers: Vec<String>,
     /// Status grouped by exact semantic treatment.
     pub families: Vec<EvaluationFamilyStatus>,
 }
@@ -188,6 +177,14 @@ pub struct EvaluationError {
 }
 
 impl Evaluation {
+    /// Reads the adapter-owned benchmark selectors requested by a TOML profile.
+    pub fn profile_benchmarks(
+        config: impl AsRef<Path>,
+        recipe: Option<&str>,
+    ) -> Result<Vec<String>, EvaluationError> {
+        EvaluationManifest::load_benchmarks(config, recipe).map_err(error)
+    }
+
     /// Appends concrete work, creating the benchmark when it does not exist.
     pub fn add(
         state_directory: impl Into<PathBuf>,
@@ -231,15 +228,10 @@ impl Evaluation {
             families.push(WorksetFamily {
                 key: family.key.clone(),
                 task_selector: family.task.clone(),
-                treatment: serde_json::to_string(&StoredTreatment {
-                    key: family.key,
-                    task: family.task,
-                    harness: family.harness,
-                    model: family.model,
-                    thinking: family.thinking.as_str().to_owned(),
-                    web_search: item.web_search,
-                })
-                .map_err(error)?,
+                harness: family.harness.clone(),
+                model: family.model.as_str().to_owned(),
+                thinking: family.thinking.as_str().to_owned(),
+                web_search: item.web_search,
                 trials: item.trials,
             });
         }
@@ -257,6 +249,29 @@ impl Evaluation {
         new_generation: bool,
     ) -> Result<(), EvaluationError> {
         let recipe = EvaluationManifest::load_profile(config, recipe).map_err(error)?;
+        Self::add_resolved_profile(recipe, state_directory, name, new_generation)
+    }
+
+    /// Expands a TOML profile plus adapter-resolved tasks into durable rows.
+    pub fn add_profile_with_tasks(
+        config: impl AsRef<Path>,
+        recipe: Option<&str>,
+        benchmark_tasks: Vec<ResolvedTask>,
+        state_directory: impl Into<PathBuf>,
+        name: &str,
+        new_generation: bool,
+    ) -> Result<(), EvaluationError> {
+        let recipe = EvaluationManifest::load_profile_with_tasks(config, recipe, benchmark_tasks)
+            .map_err(error)?;
+        Self::add_resolved_profile(recipe, state_directory, name, new_generation)
+    }
+
+    fn add_resolved_profile(
+        recipe: ResolvedProfile,
+        state_directory: impl Into<PathBuf>,
+        name: &str,
+        new_generation: bool,
+    ) -> Result<(), EvaluationError> {
         let mut work = Vec::with_capacity(recipe.families.len());
         for task in &recipe.tasks {
             for family in recipe
@@ -384,12 +399,13 @@ impl Evaluation {
         let harness = selector.harness.as_deref().unwrap_or("nanocodex");
         let mut matching = Vec::new();
         for family in families {
-            let treatment = parse_treatment(&family.treatment)?;
-            if treatment.harness == harness
-                && selector.model.is_none_or(|model| treatment.model == model)
+            if family.harness == harness
+                && selector
+                    .model
+                    .is_none_or(|model| family.model == model.as_str())
                 && selector
                     .thinking
-                    .is_none_or(|thinking| treatment.thinking == thinking)
+                    .is_none_or(|thinking| family.thinking == thinking.as_str())
             {
                 matching.push(family);
             }
@@ -440,7 +456,7 @@ impl Evaluation {
                 retained_task.selector, retained_task.digest
             ))));
         }
-        let treatment = parse_treatment(&family.treatment)?;
+        let treatment = family_treatment(&family)?;
         let harness =
             EvaluationManifest::load_harness(&self.config, &treatment.harness).map_err(error)?;
         let harnesses = harness.iter().cloned().collect();
@@ -567,7 +583,12 @@ fn observed_status(status: WorksetStatus) -> Result<EvaluationStatus, Evaluation
         .families
         .into_iter()
         .map(|family| {
-            let treatment = parse_treatment(&family.treatment)?;
+            let treatment = normalized_treatment(
+                family.harness,
+                family.model,
+                family.thinking,
+                family.web_search,
+            )?;
             Ok(EvaluationFamilyStatus {
                 id: family.key,
                 task: family.task,
@@ -589,21 +610,37 @@ fn observed_status(status: WorksetStatus) -> Result<EvaluationStatus, Evaluation
             success: status.tasks.success,
             failed: status.tasks.failed,
         },
+        workers: status.workers,
         families,
     })
 }
 
-fn parse_treatment(raw: &str) -> Result<EvaluationTreatment, EvaluationError> {
-    let treatment: StoredTreatment = serde_json::from_str(raw).map_err(error)?;
-    let thinking = treatment
-        .thinking
+fn family_treatment(family: &WorksetFamily) -> Result<EvaluationTreatment, EvaluationError> {
+    normalized_treatment(
+        family.harness.clone(),
+        family.model.clone(),
+        family.thinking.clone(),
+        family.web_search,
+    )
+}
+
+fn normalized_treatment(
+    harness: String,
+    model: String,
+    thinking: String,
+    web_search: bool,
+) -> Result<EvaluationTreatment, EvaluationError> {
+    let model = model
+        .parse()
+        .map_err(|message: String| error(std::io::Error::other(message)))?;
+    let thinking = thinking
         .parse()
         .map_err(|message: String| error(std::io::Error::other(message)))?;
     Ok(EvaluationTreatment {
-        harness: treatment.harness,
-        model: treatment.model,
+        harness,
+        model,
         thinking,
-        web_search: treatment.web_search,
+        web_search,
     })
 }
 
