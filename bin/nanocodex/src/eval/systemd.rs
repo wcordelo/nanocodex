@@ -63,7 +63,7 @@ pub(super) fn install(
 
     let executable = env::current_exe().wrap_err("failed to resolve the nanocodex executable")?;
     let arguments = service_arguments(&config, state_dir.as_deref());
-    let unit_name = unit_name(profile);
+    let unit_name = unit_name(profile)?;
     let unit = render_unit(
         &executable,
         &arguments,
@@ -205,7 +205,7 @@ fn quote(value: &OsStr) -> Result<String> {
     Ok(quoted)
 }
 
-fn unit_name(profile: &str) -> String {
+fn unit_name(profile: &str) -> Result<String> {
     let slug = profile
         .chars()
         .map(|character| {
@@ -218,11 +218,15 @@ fn unit_name(profile: &str) -> String {
         .collect::<String>();
     let slug = slug.trim_matches('-');
     let encoded = hex::encode(profile.as_bytes());
-    if slug.is_empty() {
+    let name = if slug.is_empty() {
         format!("nanocodex-benchmark-{encoded}.service")
     } else {
         format!("nanocodex-benchmark-{slug}-{encoded}.service")
+    };
+    if name.len() > 255 {
+        bail!("profile produces a systemd unit name longer than 255 bytes");
     }
+    Ok(name)
 }
 
 #[cfg(test)]
@@ -231,8 +235,13 @@ mod tests {
 
     #[test]
     fn unit_names_preserve_profile_identity() {
-        assert_ne!(unit_name("Foo"), unit_name("foo"));
-        assert_ne!(unit_name("foo_bar"), unit_name("foo-bar"));
+        assert_ne!(unit_name("Foo").unwrap(), unit_name("foo").unwrap());
+        assert_ne!(unit_name("foo_bar").unwrap(), unit_name("foo-bar").unwrap());
+    }
+
+    #[test]
+    fn unit_names_reject_oversized_profiles() {
+        assert!(unit_name(&"a".repeat(76)).is_err());
     }
 }
 
