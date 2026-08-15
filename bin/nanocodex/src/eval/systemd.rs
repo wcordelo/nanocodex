@@ -206,7 +206,7 @@ fn quote(value: &OsStr) -> Result<String> {
 }
 
 fn unit_name(profile: &str) -> String {
-    let profile = profile
+    let slug = profile
         .chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() || character == '-' {
@@ -216,7 +216,24 @@ fn unit_name(profile: &str) -> String {
             }
         })
         .collect::<String>();
-    format!("nanocodex-benchmark-{}.service", profile.trim_matches('-'))
+    let slug = slug.trim_matches('-');
+    let encoded = hex::encode(profile.as_bytes());
+    if slug.is_empty() {
+        format!("nanocodex-benchmark-{encoded}.service")
+    } else {
+        format!("nanocodex-benchmark-{slug}-{encoded}.service")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unit_name;
+
+    #[test]
+    fn unit_names_preserve_profile_identity() {
+        assert_ne!(unit_name("Foo"), unit_name("foo"));
+        assert_ne!(unit_name("foo_bar"), unit_name("foo-bar"));
+    }
 }
 
 fn user_unit_directory() -> Result<PathBuf> {
