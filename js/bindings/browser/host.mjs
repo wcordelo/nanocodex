@@ -3,6 +3,7 @@ import { createCodeRuntime } from "../runtime/code-runtime.mjs";
 const DEFAULT_MAX_QUEUED_MESSAGES = 4_096;
 const DEFAULT_MAX_QUEUED_BYTES = 32 * 1024 * 1024;
 const DEFAULT_MAX_BUFFERED_SEND_BYTES = 16 * 1024 * 1024;
+const MPP_CLIENT_PROTOCOL_ERROR_CLOSE_CODE = 3008;
 const WEBSOCKET_OPEN = 1;
 
 export function createBrowserHost(options = {}) {
@@ -13,17 +14,44 @@ export function createBrowserHost(options = {}) {
     throw new Error("WebSocket is unavailable in this runtime");
   }
   const connections = new Map();
-  const code = createCodeRuntime(options.tools);
+  const code = createCodeRuntime(options.tools, {
+    evaluate: options.codeEvaluator,
+  });
+  if (options.filesystem && options.filesystemTools === false) {
+    code.addTools({
+      apply_patch: {
+        description: "Apply a Rust-verified patch to the browser workspace.",
+        parameters: { type: "object", additionalProperties: false },
+        handler() {
+          throw new Error("apply_patch must be dispatched by the Rust workspace runtime");
+        },
+      },
+    });
+  }
+  const filesystemReady = options.filesystem && options.filesystemTools !== false
+    ? import("../runtime/workspace.mjs")
+        .then(({ tools }) => code.addTools(tools(options.filesystem)))
+    : undefined;
   const toolMode = options.toolMode ?? "code";
   if (toolMode !== "code" && toolMode !== "direct") {
     throw new TypeError("toolMode must be code or direct");
   }
+  if (options.mcp && toolMode !== "code") {
+    throw new TypeError("remote MCP requires Code Mode");
+  }
+  const mcp = options.mcp
+    ? import("../runtime/mcp-runtime.mjs").then(({ createMcpRuntime }) =>
+        createMcpRuntime(options.mcp, { clientName: "nanocodex-browser" }))
+    : undefined;
+  if (mcp) mcp.then((provider) => code.addProvider(provider), () => {});
   const onEvent = options.onEvent || (() => {});
   const maxQueuedMessages = options.maxQueuedMessages ?? DEFAULT_MAX_QUEUED_MESSAGES;
   const maxQueuedBytes = options.maxQueuedBytes ?? DEFAULT_MAX_QUEUED_BYTES;
   const maxBufferedSendBytes = options.maxBufferedSendBytes ?? DEFAULT_MAX_BUFFERED_SEND_BYTES;
   const encoder = new TextEncoder();
   let nextHandle = 1;
+  let references = 0;
+  let disposal;
 
   async function connect(endpoint, apiKey, sessionId, metadata = {}) {
     if (options.mpp) return connectMpp(endpoint);
@@ -116,7 +144,15 @@ export function createBrowserHost(options = {}) {
     });
     socket.addEventListener("close", (event) => {
       if (!connection.intentionallyClosed && !connection.overflowed) {
-        enqueue(connection, { kind: "closed", detail: `with code ${event.code ?? 1000}` });
+        const code = event.code ?? 1000;
+        const suffix = event.reason ? `: ${event.reason}` : "";
+        enqueue(connection, code === MPP_CLIENT_PROTOCOL_ERROR_CLOSE_CODE
+          ? {
+              kind: "error",
+              detail: `MPP WebSocket payment flow failed with code ${code}${suffix}`,
+              reconnectable: false,
+            }
+          : { kind: "closed", detail: `with code ${code}${suffix}` });
       }
     });
     socket.addEventListener("error", () => {
@@ -217,7 +253,27 @@ export function createBrowserHost(options = {}) {
     connection.queuedBytes += bytes;
   }
 
+  async function dispose() {
+    if (disposal) return disposal;
+    disposal = (async () => {
+      for (const handle of [...connections.keys()]) close(handle);
+      code.reset();
+      await mcp?.then((provider) => provider.close(), () => {});
+      options.onDispose?.();
+    })();
+    return disposal;
+  }
+
   return Object.freeze({
+    ready: async () => { await Promise.all([filesystemReady, mcp]); },
+    retain() {
+      if (disposal) throw new Error("Nanocodex host is already disposed");
+      references += 1;
+    },
+    release() {
+      if (references > 0) references -= 1;
+      return references === 0 ? dispose() : Promise.resolve();
+    },
     connect,
     send,
     next,
@@ -225,10 +281,26 @@ export function createBrowserHost(options = {}) {
     sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
     executeCode: code.executeCode,
     executeTool: code.executeTool,
+    cancelCode: code.cancel,
+    readWorkspaceFile: async (path) => {
+      if (!options.filesystem) throw new Error("browser workspace is unavailable");
+      return new TextDecoder("utf-8", { fatal: true })
+        .decode(await options.filesystem.readFile(path));
+    },
+    writeWorkspaceFile: async (path, contents) => {
+      if (!options.filesystem) throw new Error("browser workspace is unavailable");
+      await options.filesystem.writeFile(path, contents);
+    },
+    removeWorkspaceFile: async (path) => {
+      if (!options.filesystem) throw new Error("browser workspace is unavailable");
+      await options.filesystem.remove(path);
+    },
     toolMode: () => toolMode,
     toolDefinitions: code.toolDefinitions,
+    releaseSession: code.releaseSession,
     emitEvent: onEvent,
     reset: code.reset,
+    dispose,
   });
 }
 

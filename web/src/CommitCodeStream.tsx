@@ -27,12 +27,13 @@ import {
 import { usePierreRenderer } from "./PierreWorkerProvider";
 import { Switch } from "./Switch";
 import { useCommitStreamLoader } from "./useCommitStreamLoader";
-import type { HarnessCommit, Theme } from "./NanocodexApp";
+import type { Theme } from "./NanocodexApp";
+import type { HarnessCommit } from "./threadRepositorySnapshot";
 
 type CommitCodeStreamProps = {
   commits: HarnessCommit[];
   onOpenCommitRail?: () => void;
-  patchUrl: string;
+  patchUrl: string | ((commit: HarnessCommit) => string);
   theme: Theme;
 };
 

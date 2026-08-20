@@ -4,7 +4,7 @@ import {
   type CodeViewOptions,
 } from "@pierre/diffs";
 import { CodeView } from "@pierre/diffs/react";
-import type { FileTreePreparedInput } from "@pierre/trees";
+import { prepareFileTreeInput, type FileTreePreparedInput } from "@pierre/trees";
 import { FileTree, useFileTree } from "@pierre/trees/react";
 import { ChevronRight, FileQuestion, GitBranch, PanelLeft, Search, X } from "lucide-react";
 import {
@@ -21,30 +21,13 @@ import { fuzzyScore } from "./fuzzy";
 import { usePierreRenderer } from "./PierreWorkerProvider";
 import { CODE_VIEW_CUSTOM_CSS, CODE_VIEW_LAYOUT } from "./pierreCodeView";
 import { syntaxLanguageForFile } from "./syntax";
-
-export type RepositoryFile = {
-  path: string;
-  mode: string;
-  objectId: string;
-  size: number | null;
-  contentUrl: string | null;
-};
-
-export type SerializedTreeInput = {
-  paths: string[];
-  preparedPaths: Array<{
-    basename: string;
-    isDirectory: boolean;
-    path: string;
-    segments: string[];
-  }>;
-};
+import type { RepositoryFile } from "./threadRepositorySnapshot";
 
 type CodeBrowserProps = {
   files: RepositoryFile[];
-  treeInput: SerializedTreeInput;
   branch: string;
   head: string;
+  readFile(file: RepositoryFile): Promise<string>;
   theme: "light" | "dark";
 };
 
@@ -72,7 +55,7 @@ function countLines(contents: string | null): number | null {
 }
 
 function CodeBrowserComponent(
-  { files, treeInput, branch, head, theme }: CodeBrowserProps,
+  { files, branch, head, readFile, theme }: CodeBrowserProps,
   ref: ForwardedRef<CodeBrowserHandle>,
 ) {
   const defaultPath = useMemo(
@@ -86,15 +69,25 @@ function CodeBrowserComponent(
   const [selectedPath, setSelectedPath] = useState(defaultPath);
   const selectedPathRef = useRef(selectedPath);
   selectedPathRef.current = selectedPath;
-  const [contents, setContents] = useState<string | null>(null);
-  const [loadedObjectId, setLoadedObjectId] = useState<string | null>(null);
-  const [fileError, setFileError] = useState(false);
+  const readFileRef = useRef(readFile);
+  readFileRef.current = readFile;
+  const [loaded, setLoaded] = useState<{
+    contents: string;
+    file: RepositoryFile;
+  } | null>(null);
+  const [fileError, setFileError] = useState<string | null>(null);
   const [treeOpen, setTreeOpen] = useState(false);
   const [fileSearchOpen, setFileSearchOpen] = useState(false);
   const [fileQuery, setFileQuery] = useState("");
   const [activeFileIndex, setActiveFileIndex] = useState(0);
   const fileSearchInputRef = useRef<HTMLInputElement>(null);
   const renderer = usePierreRenderer();
+  const treeInput = useMemo(
+    () => prepareFileTreeInput(files.map((file) => file.path), {
+      flattenEmptyDirectories: true,
+    }),
+    [files],
+  );
   const { model } = useFileTree({
     preparedInput: treeInput as unknown as FileTreePreparedInput,
     flattenEmptyDirectories: true,
@@ -109,12 +102,10 @@ function CodeBrowserComponent(
     icons: { set: "standard", colored: false },
   });
   const selected = files.find((file) => file.path === selectedPath) ?? files[0];
-  const codeReady =
-    selected != null &&
-    contents !== null &&
-    loadedObjectId === selected.objectId &&
-    !fileError &&
-    renderer.ready;
+  const displayed = loaded?.file;
+  const contents = loaded?.contents ?? null;
+  const viewFile = displayed ?? selected;
+  const codeReady = loaded != null && renderer.ready;
   const fileSearchResults = useMemo(() => {
     const tokens = fileQuery.trim().split(/\s+/).filter(Boolean);
     const matches = files
@@ -233,50 +224,46 @@ function CodeBrowserComponent(
   }, [files, model]);
 
   useEffect(() => {
-    if (!selected?.contentUrl) {
-      setContents(null);
-      setLoadedObjectId(null);
-      setFileError(Boolean(selected));
+    if (!selected) {
+      setFileError(null);
       return;
     }
-    const controller = new AbortController();
-    setContents(null);
-    setLoadedObjectId(null);
-    setFileError(false);
-    fetch(selected.contentUrl, { signal: controller.signal })
-      .then((response) => {
-        if (!response.ok) throw new Error(`File request failed: ${response.status}`);
-        return response.text();
-      })
+    let active = true;
+    setFileError(null);
+    readFileRef.current(selected)
       .then((nextContents) => {
-        setContents(nextContents);
-        setLoadedObjectId(selected.objectId);
+        if (!active) return;
+        setLoaded({ contents: nextContents, file: selected });
+        setFileError(null);
       })
-      .catch((error) => {
-        if (error instanceof DOMException && error.name === "AbortError") return;
-        setFileError(true);
+      .catch(() => {
+        if (!active) return;
+        setLoaded(null);
+        setFileError(selected.path);
       });
-    return () => controller.abort();
-  }, [selected?.contentUrl, selected?.objectId]);
+    return () => {
+      active = false;
+    };
+  }, [selected?.objectId, selected?.path]);
 
   const lineCount = useMemo(() => countLines(contents), [contents]);
   const codeItems = useMemo<CodeViewItem<undefined>[]>(
     () =>
-      codeReady
+      codeReady && loaded
         ? [
             {
-              id: `file:${selected.objectId}`,
+              id: `file:${loaded.file.objectId}`,
               type: "file",
               file: {
-                name: selected.path,
-                contents,
-                cacheKey: selected.objectId,
-                lang: syntaxLanguageForFile(selected.path, contents),
+                name: loaded.file.path,
+                contents: loaded.contents,
+                cacheKey: loaded.file.objectId,
+                lang: syntaxLanguageForFile(loaded.file.path, loaded.contents),
               },
             },
           ]
         : [],
-    [codeReady, contents, selected],
+    [codeReady, loaded],
   );
   const codeViewOptions = useMemo<CodeViewOptions<undefined>>(
     () => ({
@@ -310,9 +297,9 @@ function CodeBrowserComponent(
 
       <article
         className="code-file"
-        aria-label={selected?.path ?? "File viewer"}
+        aria-label={viewFile?.path ?? "File viewer"}
       >
-        {selected ? (
+        {viewFile ? (
           <>
             <header className="code-file-header">
               <button
@@ -323,8 +310,8 @@ function CodeBrowserComponent(
               >
                 <PanelLeft aria-hidden="true" />
               </button>
-              <div className="file-breadcrumb" aria-label={selected.path}>
-                {selected.path.split("/").map((part, index, parts) => (
+              <div className="file-breadcrumb" aria-label={viewFile.path}>
+                {viewFile.path.split("/").map((part, index, parts) => (
                   <span key={`${part}-${index}`}>
                     {part}
                     {index < parts.length - 1 ? <ChevronRight aria-hidden="true" /> : null}
@@ -337,18 +324,16 @@ function CodeBrowserComponent(
                   <span>Jump to file</span>
                   <kbd>Ctrl F</kbd>
                 </button>
-                <span>{formatBytes(selected.size)}</span>
+                <span>{formatBytes(viewFile.size)}</span>
                 {lineCount !== null ? <span>{lineCount} lines</span> : null}
               </div>
             </header>
             {fileError ? (
-              <div className="code-file-frame">
-                <div className="code-file-message">
-                  <FileQuestion aria-hidden="true" />
-                  <p>This file cannot be displayed as text.</p>
-                </div>
+              <div className="code-file-tail-error" role="alert">
+                Couldn’t display {fileError}.
               </div>
-            ) : codeReady ? (
+            ) : null}
+            {codeReady ? (
               <CodeView
                 key={renderer.disableWorkerPool ? "main" : "workers"}
                 items={codeItems}
@@ -356,13 +341,14 @@ function CodeBrowserComponent(
                 disableWorkerPool={renderer.disableWorkerPool}
                 options={codeViewOptions}
               />
-            ) : (
+            ) : fileError ? (
               <div className="code-file-frame">
                 <div className="code-file-message">
-                  {contents === null ? "Loading file…" : "Preparing code renderer…"}
+                  <FileQuestion aria-hidden="true" />
+                  <p>This file cannot be displayed as text.</p>
                 </div>
               </div>
-            )}
+            ) : null}
           </>
         ) : (
           <div className="code-file-message">This snapshot has no files.</div>

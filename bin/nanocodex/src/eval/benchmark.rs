@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 use clap::Args;
 use eyre::{Result, WrapErr as _};
-use nanocodex_eval::{Evaluation, EvaluationStatus, coordinator::CoordinatorClient};
+use nanocodex_eval::{
+    Evaluation, EvaluationStatus, coordinator::CoordinatorClient, validate_prepared_eval_host,
+};
 use serde::Deserialize;
 
 use super::{profile::default_state_dir, systemd};
@@ -99,6 +101,7 @@ impl Benchmark {
         if initial.is_complete() {
             return Ok(());
         }
+        validate_prepared_eval_host().wrap_err("evaluation host preflight failed")?;
         agent.restrict_to_host_control(CONTROLLER_INSTRUCTIONS);
         let workflow = if headless {
             let _observability = observability.install(false, agent.cwd())?;
@@ -156,7 +159,11 @@ impl BoardStatus {
         coordinator: Option<&str>,
     ) -> Result<Self> {
         if let Some(coordinator) = coordinator {
-            let status = CoordinatorClient::new(coordinator)?.status().await?;
+            let mut client = CoordinatorClient::new(coordinator)?;
+            if let Some(profile) = profile {
+                client = client.profile(profile);
+            }
+            let status = client.status().await?;
             return serde_json::from_value(status)
                 .wrap_err("coordinator returned an invalid benchmark board status");
         }

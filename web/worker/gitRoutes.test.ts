@@ -1,0 +1,296 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { gzipSync } from "node:zlib";
+
+import { handleGitRequest, readGitProtocolRequest } from "./gitRoutes.ts";
+
+const head = "a".repeat(40);
+
+test("generation-pinned commit pages bypass mutable publication state", async () => {
+  let requestedKey = "";
+  const bucket = {
+    get: async (key: string) => {
+      requestedKey = key;
+      return {
+        body: new Response("[]").body,
+        httpEtag: '"page"',
+        writeHttpMetadata: () => {},
+      };
+    },
+  } as unknown as R2Bucket;
+  const request = new Request(
+    `https://nanocodex.example/api/repository/commits?page=2&generation=${head}`,
+  );
+
+  const response = await handleGitRequest(
+    request,
+    { GIT_OBJECTS: bucket },
+    new URL(request.url),
+  );
+
+  assert.equal(response?.status, 200);
+  assert.equal(requestedKey, `generations/${head}/commits/0002.json`);
+  assert.equal(response?.headers.get("x-repository-generation"), head);
+  assert.equal(response?.headers.get("cache-control"), "public, max-age=31536000, immutable");
+});
+
+test("repository uploads cannot overwrite an immutable R2 key", async () => {
+  let bodyCancelled = false;
+  let putCalled = false;
+  const existing = {
+    httpEtag: '"already-stored"',
+    size: 1_639_731,
+  } as R2Object;
+  const bucket = {
+    head: async () => existing,
+    put: async () => {
+      putCalled = true;
+      throw new Error("existing immutable objects must not enter R2.put");
+    },
+  } as unknown as R2Bucket;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      controller.enqueue(new Uint8Array(existing.size));
+      controller.close();
+    },
+    cancel() {
+      bodyCancelled = true;
+    },
+  });
+  const init: RequestInit & { duplex: "half" } = {
+    method: "PUT",
+    headers: { authorization: "Bearer mirror-token" },
+    body,
+    duplex: "half",
+  };
+  const request = new Request(
+    "https://nanocodex.example/api/git/objects/blobs/0123456789abcdef0123456789abcdef01234567",
+    init,
+  );
+
+  const response = await handleGitRequest(
+    request,
+    { GIT_OBJECTS: bucket, GIT_MIRROR_TOKEN: "mirror-token" },
+    new URL(request.url),
+  );
+
+  assert.equal(response?.status, 200);
+  assert.equal(putCalled, false);
+  assert.equal(bodyCancelled, true);
+  assert.deepEqual(await response?.json(), {
+    key: "blobs/0123456789abcdef0123456789abcdef01234567.txt",
+    etag: '"already-stored"',
+    size: existing.size,
+    stored: false,
+  });
+});
+
+test("repository uploads retain conditional creation for a new immutable key", async () => {
+  let putOptions: R2PutOptions | undefined;
+  let uploadedBody = "";
+  const created = {
+    httpEtag: '"created"',
+    size: 7,
+  } as R2Object;
+  const bucket = {
+    head: async () => null,
+    put: async (_key: string, body: ReadableStream, options?: R2PutOptions) => {
+      putOptions = options;
+      uploadedBody = await new Response(body).text();
+      return created;
+    },
+  } as unknown as R2Bucket;
+  const request = new Request(
+    "https://nanocodex.example/api/git/objects/blobs/0123456789abcdef0123456789abcdef01234567",
+    {
+      method: "PUT",
+      headers: { authorization: "Bearer mirror-token" },
+      body: "created",
+    },
+  );
+
+  const response = await handleGitRequest(
+    request,
+    { GIT_OBJECTS: bucket, GIT_MIRROR_TOKEN: "mirror-token" },
+    new URL(request.url),
+  );
+
+  assert.equal(response?.status, 200);
+  assert.equal(uploadedBody, "created");
+  assert.deepEqual(putOptions?.onlyIf, { etagDoesNotMatch: "*" });
+  assert.deepEqual(await response?.json(), {
+    key: "blobs/0123456789abcdef0123456789abcdef01234567.txt",
+    etag: '"created"',
+    size: 7,
+    stored: true,
+  });
+});
+
+test("repository publication forwards an explicit invalid-state replacement", async () => {
+  const shardKey = `generations/${head}/objects/0000.pack`;
+  const publication = {
+    version: 1 as const,
+    head,
+    branch: "master",
+    refs: [{ name: "refs/heads/master", oid: head }],
+    snapshotKey: `generations/${head}/repository.json`,
+    commitsKey: `generations/${head}/commits.json`,
+    inventoryKey: `generations/${head}/inventory.json`,
+    packKey: `generations/${head}/repository.pack`,
+    objectManifestKey: `generations/${head}/objects.json`,
+    packHash: "b".repeat(40),
+    publishedAt: "2026-08-18T00:00:00.000Z",
+  };
+  const manifest = {
+    version: 1,
+    head,
+    shards: [{ key: shardKey, size: 1 }],
+    objects: { [head]: [1, 0, 0, 1, []] },
+  };
+  let forwarded: unknown;
+  const namespace = {
+    idFromName: () => ({}) as DurableObjectId,
+    get: () => ({
+      fetch: async (_input: RequestInfo | URL, init?: RequestInit) => {
+        forwarded = JSON.parse(String(init?.body));
+        return Response.json(publication);
+      },
+    }),
+  } as unknown as DurableObjectNamespace;
+  const bucket = {
+    get: async () => ({ json: async () => manifest }),
+    head: async () => ({ httpEtag: '"present"', size: 1 }),
+  } as unknown as R2Bucket;
+  const request = new Request("https://nanocodex.example/api/git/publish", {
+    method: "PUT",
+    headers: {
+      authorization: "Bearer mirror-token",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ expectedHead: null, publication, replaceInvalid: true }),
+  });
+
+  const response = await handleGitRequest(
+    request,
+    {
+      GIT_OBJECTS: bucket,
+      GIT_REPOSITORY: namespace,
+      GIT_MIRROR_TOKEN: "mirror-token",
+    },
+    new URL(request.url),
+  );
+
+  assert.equal(response?.status, 200);
+  assert.deepEqual(forwarded, {
+    expectedHead: null,
+    publication,
+    replaceInvalid: true,
+  });
+});
+
+test("Git protocol requests accept the gzip encoding used by clone clients", async () => {
+  const expected = new TextEncoder().encode("0014command=fetch\n0000");
+  const compressed = gzipSync(expected);
+  const request = new Request("https://nanocodex.example/git/git-upload-pack", {
+    method: "POST",
+    headers: { "content-encoding": "gzip" },
+    body: compressed,
+  });
+
+  const decoded = await readGitProtocolRequest(request);
+  assert.ok(decoded instanceof Uint8Array);
+  assert.deepEqual(decoded, expected);
+});
+
+test("public Git requests are bounded after decompression", async () => {
+  const request = new Request("https://nanocodex.example/git/git-upload-pack", {
+    method: "POST",
+    headers: { "content-encoding": "gzip" },
+    body: gzipSync(new Uint8Array([1, 2, 3, 4, 5])),
+  });
+
+  const result = await readGitProtocolRequest(request, 4);
+  assert.ok(result instanceof Response);
+  assert.equal(result.status, 413);
+  assert.equal(await result.text(), "Git request is too large\n");
+});
+
+test("repository reads hit edge cache before the publication Durable Object", async () => {
+  const cache = new Map<string, Response>();
+  const originalCaches = globalThis.caches;
+  Object.defineProperty(globalThis, "caches", {
+    configurable: true,
+    value: {
+      default: {
+        match: async (request: Request) => cache.get(request.url)?.clone(),
+        put: async (request: Request, response: Response) => {
+          cache.set(request.url, response.clone());
+        },
+      },
+    },
+  });
+  let publicationReads = 0;
+  let objectReads = 0;
+  const publication = {
+    version: 1,
+    head,
+    branch: "master",
+    refs: [{ name: "refs/heads/master", oid: head }],
+    snapshotKey: `generations/${head}/repository.json`,
+    commitsKey: `generations/${head}/commits.json`,
+    inventoryKey: `generations/${head}/inventory.json`,
+    packKey: `generations/${head}/repository.pack`,
+    objectManifestKey: `generations/${head}/objects.json`,
+    packHash: "b".repeat(40),
+    publishedAt: "2026-08-17T00:00:00.000Z",
+  };
+  const namespace = {
+    idFromName: () => ({}) as DurableObjectId,
+    get: () => ({
+      fetch: async () => {
+        publicationReads += 1;
+        return Response.json(publication);
+      },
+    }),
+  } as unknown as DurableObjectNamespace;
+  const bucket = {
+    get: async () => {
+      objectReads += 1;
+      return {
+        body: new Response('{"tree":[]}').body,
+        httpEtag: '"snapshot"',
+        writeHttpMetadata: () => {},
+      };
+    },
+  } as unknown as R2Bucket;
+  const pending: Promise<unknown>[] = [];
+  const context = {
+    waitUntil: (promise: Promise<unknown>) => pending.push(promise),
+  } as unknown as ExecutionContext;
+  const request = new Request("https://nanocodex.example/api/repository/snapshot");
+
+  try {
+    const first = await handleGitRequest(
+      request,
+      { GIT_OBJECTS: bucket, GIT_REPOSITORY: namespace },
+      new URL(request.url),
+      context,
+    );
+    assert.equal(first?.status, 200);
+    await Promise.all(pending);
+    const second = await handleGitRequest(
+      request,
+      { GIT_OBJECTS: bucket, GIT_REPOSITORY: namespace },
+      new URL(request.url),
+      context,
+    );
+    assert.equal(second?.status, 200);
+    assert.equal(publicationReads, 1);
+    assert.equal(objectReads, 1);
+  } finally {
+    Object.defineProperty(globalThis, "caches", {
+      configurable: true,
+      value: originalCaches,
+    });
+  }
+});

@@ -18,7 +18,7 @@ use nanocodex::tools::mcp::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const DEFAULT_MCP_SERVERS: [(&str, &str, &str); 3] = [
+const DEFAULT_MCP_SERVERS: [(&str, &str, &str); 5] = [
     (
         "openaiDeveloperDocs",
         "https://developers.openai.com/mcp",
@@ -34,11 +34,33 @@ const DEFAULT_MCP_SERVERS: [(&str, &str, &str); 3] = [
         "https://docs.mcp.cloudflare.com/mcp",
         "Search Cloudflare developer documentation.",
     ),
+    (
+        "viem",
+        "https://viem.sh/api/mcp",
+        "Search Viem developer documentation.",
+    ),
+    (
+        "vocs",
+        "https://vocs.dev/api/mcp",
+        "Search Vocs developer documentation.",
+    ),
 ];
+pub(crate) const MERCATOR_MCP_URL: &str = "https://mercator.tempoxyz.dev/mcp";
+const MERCATOR_MCP_DESCRIPTION: &str = "Discovers and composes paid Tempo services and MPP flows.";
+
+fn default_parallel_tools(name: &str) -> &'static [&'static str] {
+    match name {
+        "openaiDeveloperDocs" => &["fetch_openai_doc", "search_openai_docs"],
+        "tempo" => &["code", "search"],
+        "cloudflare" => &["search_cloudflare_documentation"],
+        "viem" | "vocs" => &["list_pages", "read_page", "search_docs", "search_source"],
+        _ => &[],
+    }
+}
 
 #[derive(Args)]
 pub(crate) struct McpArgs {
-    /// Load the standard `OpenAI`, Tempo, and Cloudflare MCP servers.
+    /// Load the standard docs MCPs, plus paid Mercator in Tempo provider mode.
     #[arg(
         long,
         env = "NANOCODEX_MCP_DEFAULTS",
@@ -47,11 +69,11 @@ pub(crate) struct McpArgs {
     )]
     mcp_defaults: bool,
 
-    /// Load enabled MCP servers from `$CODEX_HOME/config.toml`.
+    /// Also load enabled MCP servers from `$CODEX_HOME/config.toml`.
     #[arg(
         long,
         env = "NANOCODEX_MCP_CODEX_CONFIG",
-        default_value_t = true,
+        default_value_t = false,
         action = ArgAction::Set
     )]
     mcp_codex_config: bool,
@@ -103,6 +125,7 @@ struct ServerConfig {
     tool_timeout: Option<Duration>,
     enabled_tools: Option<Vec<String>>,
     disabled_tools: Vec<String>,
+    parallel_tools: Vec<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -185,7 +208,11 @@ impl McpArgs {
         self.header_env.clear();
     }
 
-    pub(crate) fn build(self, codex_home: &Path) -> Result<Option<ConfiguredMcp>> {
+    pub(crate) fn build(
+        self,
+        codex_home: &Path,
+        tempo: Option<&crate::mpp::MppAdapter>,
+    ) -> Result<Option<ConfiguredMcp>> {
         if self.mcp_startup_timeout == 0 || self.mcp_tool_timeout == 0 {
             bail!("MCP timeouts must be greater than zero");
         }
@@ -232,6 +259,29 @@ impl McpArgs {
                         tool_timeout: None,
                         enabled_tools: None,
                         disabled_tools: Vec::new(),
+                        parallel_tools: default_parallel_tools(name)
+                            .iter()
+                            .map(|tool| (*tool).to_owned())
+                            .collect(),
+                    });
+            }
+            if tempo.is_some() && !codex_server_names.contains("mercator") {
+                servers
+                    .entry("mercator".to_owned())
+                    .or_insert_with(|| ServerConfig {
+                        transport: Transport::Http(MERCATOR_MCP_URL.to_owned()),
+                        description: Some(MERCATOR_MCP_DESCRIPTION.to_owned()),
+                        arguments: Vec::new(),
+                        environment: BTreeMap::new(),
+                        cwd: None,
+                        bearer_env: None,
+                        headers: BTreeMap::new(),
+                        header_env: Vec::new(),
+                        startup_timeout: None,
+                        tool_timeout: None,
+                        enabled_tools: None,
+                        disabled_tools: Vec::new(),
+                        parallel_tools: Vec::new(),
                     });
             }
         }
@@ -276,6 +326,7 @@ impl McpArgs {
             startup_timeout,
             tool_timeout,
             oauth_store,
+            tempo,
         )?))
     }
 }
@@ -285,6 +336,7 @@ fn build_mcp(
     startup_timeout: Duration,
     tool_timeout: Duration,
     oauth_store: Option<Arc<CodexOAuthStore>>,
+    tempo: Option<&crate::mpp::MppAdapter>,
 ) -> Result<ConfiguredMcp> {
     let mut builder = Mcp::builder();
     if let Some(store) = oauth_store {
@@ -292,6 +344,12 @@ fn build_mcp(
     }
     for (name, server) in servers {
         let description = server.description;
+        let payment = match &server.transport {
+            Transport::Http(url) if name == "mercator" => tempo
+                .map(|tempo| tempo.mcp_payment_provider(url))
+                .transpose()?,
+            _ => None,
+        };
         let mut configured = match server.transport {
             Transport::Http(url) => McpServer::http(url),
             Transport::Stdio(command) => {
@@ -310,6 +368,9 @@ fn build_mcp(
         if let Some(description) = description {
             configured = configured.description(description);
         }
+        if let Some(payment) = payment {
+            configured = configured.payment_provider(payment);
+        }
         if let Some(variable) = server.bearer_env {
             configured = configured.bearer_token_env(variable);
         }
@@ -322,7 +383,9 @@ fn build_mcp(
         if let Some(enabled_tools) = server.enabled_tools {
             configured = configured.enabled_tools(enabled_tools);
         }
-        configured = configured.disabled_tools(server.disabled_tools);
+        configured = configured
+            .disabled_tools(server.disabled_tools)
+            .parallel_tools(server.parallel_tools);
         builder = builder.server(name, configured);
     }
     let provider = builder.build()?;
@@ -651,6 +714,7 @@ impl CodexMcpServer {
             tool_timeout,
             enabled_tools: self.enabled_tools,
             disabled_tools: self.disabled_tools,
+            parallel_tools: Vec::new(),
         }))
     }
 }
@@ -686,6 +750,7 @@ fn insert_server(
                 tool_timeout: None,
                 enabled_tools: None,
                 disabled_tools: Vec::new(),
+                parallel_tools: Vec::new(),
             },
         )
         .is_some()
@@ -771,7 +836,7 @@ mod tests {
 
     #[test]
     fn default_mcp_servers_build() {
-        assert!(args().build(Path::new("/missing")).unwrap().is_some());
+        assert!(args().build(Path::new("/missing"), None).unwrap().is_some());
     }
 
     #[test]
@@ -781,7 +846,7 @@ mod tests {
                 mcp_defaults: false,
                 ..args()
             }
-            .build(Path::new("/missing"))
+            .build(Path::new("/missing"), None)
             .unwrap()
             .is_none()
         );
@@ -795,7 +860,7 @@ mod tests {
             value: "https://example.test/mcp".to_owned(),
         });
 
-        assert!(args.build(Path::new("/missing")).unwrap().is_some());
+        assert!(args.build(Path::new("/missing"), None).unwrap().is_some());
     }
 
     #[test]
@@ -808,7 +873,7 @@ mod tests {
             });
         }
 
-        assert!(args.build(Path::new("/missing")).is_err());
+        assert!(args.build(Path::new("/missing"), None).is_err());
     }
 
     #[tokio::test]
@@ -840,7 +905,7 @@ enabled = false
         .unwrap();
         let mut args = args();
         args.mcp_codex_config = true;
-        let mcp = args.build(codex_home.path()).unwrap().unwrap();
+        let mcp = args.build(codex_home.path(), None).unwrap().unwrap();
         let tools = Tools::builder()
             .exposure(ToolExposure::DirectAndCodeMode)
             .provider(mcp.provider)
@@ -855,6 +920,8 @@ enabled = false
         assert!(encoded.contains("local"));
         assert!(encoded.contains("openaiDeveloperDocs"));
         assert!(encoded.contains("cloudflare"));
+        assert!(encoded.contains("viem"));
+        assert!(encoded.contains("vocs"));
         assert!(!encoded.contains("\n- tempo:"));
     }
 
@@ -1160,7 +1227,7 @@ tool_timeout_sec = 9.5
         )
         .unwrap();
 
-        let mcp = args().build(Path::new("/missing")).unwrap().unwrap();
+        let mcp = args().build(Path::new("/missing"), None).unwrap().unwrap();
         let default_tools = Tools::builder().provider(mcp.provider).build().unwrap();
         let with_defaults = serde_json::to_vec(
             &ToolRuntime::new_with_tools(".", None, None, &default_tools)

@@ -12,16 +12,36 @@ export type TuiTarget =
   | { pane: "main"; branchId: number }
   | { pane: "btw"; id: number };
 
+export type VoiceTranscriptEntry = Readonly<{
+  role: "user" | "assistant";
+  text: string;
+}>;
+
+export type VoiceDelegation =
+  | { kind: "request"; input: string; transcript: readonly VoiceTranscriptEntry[] }
+  | { kind: "tail"; transcript: readonly VoiceTranscriptEntry[] };
+
+export type VoiceSessionContext = Readonly<{
+  workspace: string;
+  history: readonly Record<string, unknown>[];
+}>;
+
 export type TuiCommand =
   | { type: "start"; thinking: "none" | "low" | "medium" | "high" | "xhigh" | "max"; reasoningMode: "standard" | "pro" }
   | { type: "prompt"; target: TuiTarget; id: number; prompt: string; images?: string[]; intent: "immediate" | "queue" }
   | { type: "cancel"; target: TuiTarget }
   | { type: "openBtw"; id: number; sourceBranchId: number; promptId?: number; prompt?: string; images?: string[] }
   | { type: "closeBtw"; id: number }
-  | { type: "historicalFork"; sourceBranchId: number; newBranchId: number; selectedPromptId: number; newPromptId: number; prompt: string };
+  | { type: "historicalFork"; sourceBranchId: number; newBranchId: number; selectedPromptId: number; newPromptId: number; prompt: string }
+  | { type: "voiceLifecycle"; id: number; target: TuiTarget; action: "start" | "stop" }
+  | { type: "voicePrompt"; target: TuiTarget; id: number; delegation: VoiceDelegation }
+  | { type: "voiceTranscript"; target: TuiTarget; speaker: "user" | "assistant"; text: string };
 
 export type TuiMessage =
   | { type: "ready"; sessionId: string }
+  | { type: "externalPrompt"; target: TuiTarget; id: number; prompt: string; intent?: "immediate" | "queue" }
+  | { type: "voiceTranscript"; target: TuiTarget; speaker: "user" | "assistant"; text: string }
+  | { type: "voiceLifecycleResult"; id: number; action: "start" | "stop"; context?: VoiceSessionContext; error?: string }
   | { type: "event"; target: TuiTarget; event: AgentEvent }
   | { type: "turnFinished"; target: TuiTarget; id: number; message?: string; error?: string }
   | { type: "steerAdmitted"; target: TuiTarget; id: number }
@@ -163,11 +183,49 @@ export function steerFailed(
   return appendError(removeSteer(state, id), error);
 }
 
-export function turnFinished(state: TerminalState, error?: string): TerminalState {
-  const next = {
+export function turnFinished(
+  state: TerminalState,
+  error?: string,
+  finalMessage?: string,
+): TerminalState {
+  let next = {
     ...state,
     pendingTurns: Math.max(0, state.pendingTurns - 1),
   };
+  if (finalMessage?.trim()) {
+    let userIndex = -1;
+    let assistantIndex = -1;
+    for (let index = next.entries.length - 1; index >= 0; index -= 1) {
+      if (next.entries[index]?.kind === "user") {
+        userIndex = index;
+        break;
+      }
+    }
+    for (let index = next.entries.length - 1; index > userIndex; index -= 1) {
+      if (next.entries[index]?.kind === "assistant") {
+        assistantIndex = index;
+        break;
+      }
+    }
+    if (assistantIndex >= 0) {
+      const assistant = next.entries[assistantIndex];
+      if (assistant?.kind === "assistant" && assistant.text !== finalMessage) {
+        const entries = next.entries.slice();
+        entries[assistantIndex] = { ...assistant, text: finalMessage, streaming: false };
+        next = { ...next, entries };
+      }
+    } else {
+      const syntheticId = next.syntheticId + 1;
+      next = {
+        ...next,
+        syntheticId,
+        entries: [
+          ...next.entries,
+          { id: `assistant-result-${syntheticId}`, kind: "assistant", text: finalMessage, streaming: false },
+        ],
+      };
+    }
+  }
   if (!error || error === "the turn was cancelled") return next;
   const tail = next.entries.at(-1);
   return tail?.kind === "error" && tail.text === error ? next : appendError(next, error);
@@ -193,6 +251,29 @@ export function appendError(state: TerminalState, text: string): TerminalState {
     ...state,
     syntheticId,
     entries: [...state.entries, { id: `error-${syntheticId}`, kind: "error", text }],
+  };
+}
+
+/** Append one completed voice transcript without treating it as agent input. */
+export function appendVoiceTranscript(
+  state: TerminalState,
+  speaker: "user" | "assistant",
+  text: string,
+): TerminalState {
+  const syntheticId = state.syntheticId + 1;
+  const label = speaker === "user" ? "🎙 You" : "🔊 Voice";
+  return {
+    ...state,
+    syntheticId,
+    entries: [
+      ...state.entries,
+      {
+        id: `voice-${syntheticId}`,
+        kind: "assistant",
+        text: `**${label}:** ${text}`,
+        streaming: false,
+      },
+    ],
   };
 }
 

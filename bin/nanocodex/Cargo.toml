@@ -45,11 +45,12 @@ jsonschema.workspace = true
 nanocodex.workspace = true
 nanocodex-browser.workspace = true
 nanocodex-observability.workspace = true
+nanocodex-subagents.workspace = true
 nanocodex-voice.workspace = true
 nix.workspace = true
 nanousd = { workspace = true, optional = true }
 pulldown-cmark.workspace = true
-mpp = { workspace = true, optional = true, features = ["middleware", "tempo", "reqwest-rustls-tls-no-provider"] }
+mpp = { workspace = true, optional = true, features = ["middleware", "sqlite", "tempo", "reqwest-rustls-tls-no-provider"] }
 nanocodex-egress = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 ratatui.workspace = true

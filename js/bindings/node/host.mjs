@@ -5,23 +5,37 @@ import WebSocket from "ws";
 import packageMetadata from "../package.json" with { type: "json" };
 
 import { createCodeRuntime } from "../runtime/code-runtime.mjs";
+import { createMcpRuntime } from "../runtime/mcp-runtime.mjs";
 
 const RESPONSES_WEBSOCKETS_BETA = "responses_websockets=2026-02-06";
 const USER_AGENT = `nanocodex-wasm/${packageMetadata.version}`;
 const DEFAULT_MAX_QUEUED_MESSAGES = 4_096;
 const DEFAULT_MAX_QUEUED_BYTES = 32 * 1024 * 1024;
 const DEFAULT_MAX_FRAME_BYTES = 16 * 1024 * 1024;
+const MPP_CLIENT_PROTOCOL_ERROR_CLOSE_CODE = 3008;
 
 export function createNodeHost(options = {}) {
   const connections = new Map();
   const code = createCodeRuntime(options.tools, {
     require: createRequire(resolve(options.workspace ?? process.cwd(), ".nanocodex-code-mode.cjs")),
     console: new Console({ stdout: process.stderr, stderr: process.stderr }),
+    evaluate: options.codeEvaluator,
   });
+  const filesystem = options.filesystem
+    ? import("../runtime/workspace.mjs")
+        .then(({ tools }) => code.addTools(tools(options.filesystem)))
+    : undefined;
   const toolMode = options.toolMode ?? "code";
   if (toolMode !== "code" && toolMode !== "direct") {
     throw new TypeError("toolMode must be code or direct");
   }
+  if (options.mcpServers && toolMode !== "code") {
+    throw new TypeError("remote MCP requires Code Mode");
+  }
+  const mcp = options.mcpServers
+    ? createMcpRuntime(options.mcpServers, { clientName: "nanocodex-node" })
+    : undefined;
+  if (mcp) mcp.then((provider) => code.addProvider(provider), () => {});
   const onEvent = options.onEvent || (() => {});
   const connectTimeoutMs = options.connectTimeoutMs ?? 30_000;
   const sendTimeoutMs = options.sendTimeoutMs ?? 30_000;
@@ -29,6 +43,8 @@ export function createNodeHost(options = {}) {
   const maxQueuedBytes = options.maxQueuedBytes ?? DEFAULT_MAX_QUEUED_BYTES;
   const maxFrameBytes = options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;
   let nextHandle = 1;
+  let references = 0;
+  let disposal;
 
   function connect(endpoint, apiKey, sessionId, metadata = {}) {
     if (options.mpp) return connectMpp(endpoint);
@@ -125,8 +141,15 @@ export function createNodeHost(options = {}) {
     });
     socket.addEventListener("close", (event) => {
       if (!connection.intentionallyClosed && !connection.overflowed) {
+        const code = event.code ?? 1000;
         const suffix = event.reason ? `: ${event.reason}` : "";
-        enqueue(connection, { kind: "closed", detail: `with code ${event.code ?? 1000}${suffix}` });
+        enqueue(connection, code === MPP_CLIENT_PROTOCOL_ERROR_CLOSE_CODE
+          ? {
+              kind: "error",
+              detail: `MPP WebSocket payment flow failed with code ${code}${suffix}`,
+              reconnectable: false,
+            }
+          : { kind: "closed", detail: `with code ${code}${suffix}` });
       }
     });
     socket.addEventListener("error", () => {
@@ -234,7 +257,27 @@ export function createNodeHost(options = {}) {
     connection.queuedBytes += bytes;
   }
 
+  async function dispose() {
+    if (disposal) return disposal;
+    disposal = (async () => {
+      for (const handle of [...connections.keys()]) close(handle);
+      code.reset();
+      await mcp?.then((provider) => provider.close(), () => {});
+      options.onDispose?.();
+    })();
+    return disposal;
+  }
+
   return Object.freeze({
+    ready: async () => { await Promise.all([filesystem, mcp]); },
+    retain() {
+      if (disposal) throw new Error("Nanocodex host is already disposed");
+      references += 1;
+    },
+    release() {
+      if (references > 0) references -= 1;
+      return references === 0 ? dispose() : Promise.resolve();
+    },
     connect,
     send,
     next,
@@ -242,10 +285,13 @@ export function createNodeHost(options = {}) {
     sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
     executeCode: code.executeCode,
     executeTool: code.executeTool,
+    cancelCode: code.cancel,
     toolMode: () => toolMode,
     toolDefinitions: code.toolDefinitions,
+    releaseSession: code.releaseSession,
     emitEvent: onEvent,
     reset: code.reset,
+    dispose,
   });
 }
 

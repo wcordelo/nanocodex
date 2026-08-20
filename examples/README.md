@@ -2,13 +2,14 @@
 
 All language consumers live at this repository boundary:
 
-- Rust: `minimal.rs`, `voice.rs`, `realtime_pipe.rs`, `follow_on.rs`, `lifecycle.rs`,
-  `custom_tool.rs`, `subagents.rs`, `resume.rs`, `fork_conversations.rs`,
+- Rust: `minimal.rs`, `durable.rs`, `voice.rs`, `realtime_pipe.rs`, `follow_on.rs`,
+  `lifecycle.rs`, `custom_tool.rs`, `subagents.rs`, `resume.rs`, `fork_conversations.rs`,
   `fork_checkpoint_bench.rs`, `secret_egress.rs`, and `mcp.rs` are binaries in the
   `nanocodex-examples` package.
 - Python: `python/` uses the native PyO3 binding (`follow_on.py`, `events.py`,
   `lifecycle.py`).
-- Node.js: `node/` uses the shared Rust/WASM package with a Node WebSocket host.
+- Node.js: `node/` uses the shared Rust/WASM package with a Node WebSocket host
+  and demonstrates the Rust-owned task-tree extension compiled into WASM.
 - Browser: `react-vite/` runs that WASM agent in a module Worker and renders its
   ordered events in React.
 - Browser CDN: `browser-cdn/` is one static HTML file that imports the published
@@ -18,6 +19,9 @@ All language consumers live at this repository boundary:
 - Cloudflare Workers: `cloudflare-workers/` runs the Rust/WASM harness inside a
   SQLite-backed Durable Object, with a Sandbox container and R2-backed
   workspace, and proves hibernation-safe session recovery.
+- Cloudflare fetch + MCP: `cloudflare-fetch-mcp/` exposes one authenticated HTTP
+  fetch endpoint backed by Rust/WASM, Tempo MPP, deferred Mercator MCP tools,
+  and QuickJS Code Mode inside a serialized Durable Object wallet owner.
 - Vercel Workflows: `vercel-workflows/` runs Nanocodex as a durable Workflow
   actor with a persistent Vercel Sandbox, replayable state, and synchronized
   native WebSocket clients.
@@ -28,6 +32,8 @@ From the repository root:
 
 ```sh
 cargo run -p nanocodex-examples --bin minimal
+# Compose OpenAI, tools, the agent lifecycle, and the optional durability layer:
+cargo run -p nanocodex-examples --bin durable
 # Own the default microphone and speaker directly in Rust:
 cargo run -p nanocodex-examples --bin voice
 # Or keep devices outside the process and compose raw PCM with Unix pipes:
@@ -44,6 +50,7 @@ just build-vm-example
 target/debug/vm-tools ROOTFS [GUEST_RUNTIME_BINARY_OR_EXT4]
 just smoke-python
 just smoke-wasm-node
+npm run subagents --prefix examples/node -- "Review the JS API"
 just build-react-example
 just build-rivet-example
 just build-cloudflare-example
@@ -65,7 +72,8 @@ adapters over the same typed Realtime events and retained agent lifecycle.
 Both use the shared Codex/ChatGPT subscription credentials at
 `$CODEX_HOME/auth.json` or `~/.codex/auth.json`; `NANOCODEX_AUTH_FILE` overrides
 that path. Run `nanocodex auth login` once if the shared credential does not
-exist.
+exist. Business and Enterprise hosts can instead set a persistent
+`CODEX_ACCESS_TOKEN=at-...` without a browser login.
 
 The other command-line examples use `OPENAI_API_KEY` by default. The browser
 example instead asks the

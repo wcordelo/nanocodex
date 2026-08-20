@@ -16,6 +16,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   Suspense,
   lazy,
+  startTransition,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -26,12 +27,16 @@ import {
 import { useLocation, useNavigate } from "react-router";
 import type { CodeBrowserHandle } from "./CodeBrowser";
 import type { CommitCodeStreamHandle } from "./CommitCodeStream";
+import { evalApi } from "./evalApi";
 import { fuzzyScore } from "./fuzzy";
 import { pathForSurface, surfaceFromUrl, type Surface } from "./navigation";
+import type { PublishedRepositorySnapshot } from "./publishedRepository";
+import type { HarnessCommit } from "./threadRepositorySnapshot";
+import { getBrowserThread } from "nanocodex/tools/browser";
 
-const Evals = lazy(() =>
-  import("./Evals").then((module) => ({ default: module.Evals }))
-);
+const loadEvals = () =>
+  import("./Evals").then((module) => ({ default: module.Evals }));
+const Evals = lazy(loadEvals);
 const AgentTerminal = lazy(() =>
   import("./AgentTerminal").then((module) => ({
     default: module.AgentTerminal,
@@ -59,67 +64,8 @@ const VirtualCommitList = lazy(() =>
 export type Theme = "light" | "dark";
 type Scope = "all" | "eval" | "fix" | "docs" | "perf";
 type ProposalState = "ready" | "submitting" | "payment-required";
-type RepositoryFile = {
-  path: string;
-  mode: string;
-  objectId: string;
-  size: number | null;
-  contentUrl: string | null;
-};
-
-type SerializedTreeInput = {
-  paths: string[];
-  preparedPaths: Array<{
-    basename: string;
-    isDirectory: boolean;
-    path: string;
-    segments: string[];
-  }>;
-};
-
-export type ChangedFile = {
-  path: string;
-  previousPath: string | null;
-  status: string;
-  additions: number | null;
-  deletions: number | null;
-};
-
-export type HarnessCommit = {
-  hash: string;
-  shortHash: string;
-  parents: string[];
-  author: string;
-  authoredAt: string;
-  refs: string[];
-  subject: string;
-  body: string;
-  files: ChangedFile[];
-  stats: {
-    files: number;
-    additions: number;
-    deletions: number;
-  };
-};
-
-type RepositorySnapshot = {
-  repository: {
-    fullName: string;
-    branch: string;
-    head: string;
-    totalCommits: number;
-    dirty: boolean;
-    dirtyCount: number;
-  };
-  generatedAt: string;
-  commitPatchUrl: string;
-  tree: RepositoryFile[];
-  treeInput: SerializedTreeInput;
-  commits: HarnessCommit[];
-};
 
 const emptyCommits: HarnessCommit[] = [];
-let repositorySnapshotPromise: Promise<RepositorySnapshot> | undefined;
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
@@ -130,14 +76,26 @@ const queryClient = new QueryClient({
   },
 });
 
-function loadRepositorySnapshot(): Promise<RepositorySnapshot> {
-  repositorySnapshotPromise ??= import("./data/harness-repository.json").then(
-    (module) => module.default as RepositorySnapshot,
-  ).catch((error) => {
-    repositorySnapshotPromise = undefined;
-    throw error;
-  });
-  return repositorySnapshotPromise;
+function preloadEvalOverview() {
+  void loadEvals().catch(() => undefined);
+  void Promise.all([
+    queryClient.prefetchQuery({
+      queryKey: ["evals", "overview"],
+      queryFn: ({ signal }) => evalApi.overview(signal),
+    }),
+    queryClient.prefetchQuery({
+      queryKey: ["evals", "cluster"],
+      queryFn: ({ signal }) => evalApi.cluster(signal),
+      staleTime: 5_000,
+    }),
+  ]).catch(() => undefined);
+}
+
+function loadRepositorySnapshot(
+  includeHistory: boolean,
+): Promise<PublishedRepositorySnapshot> {
+  return import("./publishedRepository")
+    .then((module) => module.loadPublishedRepositorySnapshot(includeHistory));
 }
 
 const scopes: Array<{ id: Scope; label: string }> = [
@@ -180,12 +138,23 @@ function commitSearchScore(commit: HarnessCommit, tokens: readonly string[]) {
 const installCommand =
   "curl -fsSL https://nanocodex.paradigm.xyz | bash";
 
-function RepositorySurfaceLoading({ failed }: { failed: boolean }) {
+function RepositorySurfaceError({
+  failed,
+  onRetry,
+}: {
+  failed: boolean;
+  onRetry(): void;
+}) {
+  if (!failed) return null;
   return (
-    <section className="requests-empty page-grid" aria-live="polite">
+    <section className="requests-empty page-grid" role="alert">
       <GitBranch aria-hidden="true" />
       <p className="eyebrow">Repository</p>
-      <h1>{failed ? "Repository data unavailable." : "Loading repository…"}</h1>
+      <h1>Published repository unavailable.</h1>
+      <p>The Code and Commits publication could not be loaded.</p>
+      <button className="button button--medium" type="button" onClick={onRetry}>
+        Try again
+      </button>
     </section>
   );
 }
@@ -201,6 +170,7 @@ export function NanocodexApp() {
 function NanocodexShell() {
   const location = useLocation();
   const navigate = useNavigate();
+  const thread = useMemo(getBrowserThread, []);
   const [theme, setTheme] = useState<Theme>(() => {
     const initialTheme = document.documentElement.dataset.theme;
     if (initialTheme === "dark" || initialTheme === "light")
@@ -213,7 +183,7 @@ function NanocodexShell() {
     pathname: location.pathname,
     searchParams: new URLSearchParams(location.search),
   });
-  const [snapshot, setSnapshot] = useState<RepositorySnapshot>();
+  const [snapshot, setSnapshot] = useState<PublishedRepositorySnapshot>();
   const [repositoryLoadError, setRepositoryLoadError] = useState(false);
   const [scope, setScope] = useState<Scope>("all");
   const [query, setQuery] = useState("");
@@ -224,10 +194,13 @@ function NanocodexShell() {
   const [proposalTitle, setProposalTitle] = useState("");
   const [commitRailOpen, setCommitRailOpen] = useState(false);
   const [installCopied, setInstallCopied] = useState(false);
+  const needsRepository = surface === "code" || surface === "commits" || proposalOpen;
+  const needsRepositoryHistory = surface === "commits" || proposalOpen;
   const searchInputRef = useRef<HTMLInputElement>(null);
   const headerCenterRef = useRef<HTMLDivElement>(null);
   const codeBrowserRef = useRef<CodeBrowserHandle>(null);
   const commitStreamRef = useRef<CommitCodeStreamHandle>(null);
+  const repositoryRequestId = useRef(0);
 
   const commits = snapshot?.commits ?? emptyCommits;
   const selected = useMemo(
@@ -297,26 +270,43 @@ function NanocodexShell() {
     [commits, queryTokens, searchOpen],
   );
 
-  useEffect(() => {
-    const needsRepository =
-      surface === "code" || surface === "commits" || proposalOpen;
-    if (!needsRepository || snapshot) return;
-    let active = true;
+  const refreshRepository = useCallback(() => {
+    if (!needsRepository) return;
+    const requestId = ++repositoryRequestId.current;
     setRepositoryLoadError(false);
-    void loadRepositorySnapshot().then(
+    void loadRepositorySnapshot(needsRepositoryHistory).then(
       (loaded) => {
-        if (!active) return;
+        if (repositoryRequestId.current !== requestId) return;
         setSnapshot(loaded);
-        setSelectedHash((current) => current ?? loaded.repository.head);
+        setSelectedHash((current) => current && loaded.commits.some(({ hash }) => hash === current)
+          ? current
+          : loaded.repository.head);
       },
       () => {
-        if (active) setRepositoryLoadError(true);
+        if (
+          repositoryRequestId.current === requestId
+        ) {
+          setRepositoryLoadError(true);
+        }
       },
     );
-    return () => {
-      active = false;
-    };
-  }, [proposalOpen, snapshot, surface]);
+  }, [needsRepository, needsRepositoryHistory]);
+
+  useEffect(() => {
+    if (!needsRepository) {
+      repositoryRequestId.current++;
+      setSnapshot(undefined);
+      setRepositoryLoadError(false);
+      return;
+    }
+    if (!snapshot || (needsRepositoryHistory && !snapshot.historyLoaded)) {
+      refreshRepository();
+    }
+  }, [needsRepository, needsRepositoryHistory, refreshRepository, snapshot]);
+
+  useEffect(() => () => {
+    repositoryRequestId.current++;
+  }, []);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -326,9 +316,14 @@ function NanocodexShell() {
     localStorage.setItem("nanocodex-theme", theme);
   }, [theme]);
 
+  const threadSurfacePath = useCallback(
+    (nextSurface: Surface) => `${pathForSurface(nextSurface)}?thread=${thread.id}`,
+    [thread.id],
+  );
   const navigateToSurface = useCallback((nextSurface: Surface) => {
-    navigate(pathForSurface(nextSurface));
-  }, [navigate]);
+    if (nextSurface === "evals") preloadEvalOverview();
+    startTransition(() => navigate(threadSurfacePath(nextSurface)));
+  }, [navigate, threadSurfacePath]);
 
   useLayoutEffect(() => {
     const headerCenter = headerCenterRef.current;
@@ -472,7 +467,7 @@ function NanocodexShell() {
         <header className="site-header">
           <a
             className="wordmark"
-            href="/"
+            href={threadSurfacePath("home")}
             aria-label="nanocodex home"
             onClick={(event) => {
               event.preventDefault();
@@ -482,10 +477,10 @@ function NanocodexShell() {
             nanocodex <span>[H]</span>
           </a>
           <div className="header-center" ref={headerCenterRef}>
-            <nav className="surface-switch" aria-label="Repository surfaces">
+            <nav className="surface-switch" aria-label="Product navigation">
               <a
                 className={surface === "code" ? "is-active" : ""}
-                href={pathForSurface("code")}
+                href={threadSurfacePath("code")}
                 onClick={(event) => {
                   event.preventDefault();
                   navigateToSurface("code");
@@ -495,7 +490,7 @@ function NanocodexShell() {
               </a>
               <a
                 className={surface === "commits" ? "is-active" : ""}
-                href={pathForSurface("commits")}
+                href={threadSurfacePath("commits")}
                 onClick={(event) => {
                   event.preventDefault();
                   navigateToSurface("commits");
@@ -505,7 +500,7 @@ function NanocodexShell() {
               </a>
               <a
                 className={surface === "requests" ? "is-active" : ""}
-                href={pathForSurface("requests")}
+                href={threadSurfacePath("requests")}
                 onClick={(event) => {
                   event.preventDefault();
                   navigateToSurface("requests");
@@ -515,13 +510,18 @@ function NanocodexShell() {
               </a>
               <a
                 className={surface === "evals" ? "is-active" : ""}
-                href={pathForSurface("evals")}
+                href={threadSurfacePath("evals")}
+                onFocus={preloadEvalOverview}
+                onPointerEnter={preloadEvalOverview}
                 onClick={(event) => {
                   event.preventDefault();
                   navigateToSurface("evals");
                 }}
               >
                 Evals <span>[E]</span>
+              </a>
+              <a className="docs-nav" href="/docs/">
+                Docs <ArrowUpRight aria-hidden="true" size={11} />
               </a>
             </nav>
           </div>
@@ -560,30 +560,306 @@ function NanocodexShell() {
             <section className="home-page" aria-labelledby="home-title">
                 <article className="home-article">
                   <header className="home-intro">
+                    <p className="eyebrow">OpenAI coding agent SDK</p>
                     <h1 id="home-title">
-                      Nanocodex: a headless Codex runtime you can embed.
+                      A complete OpenAI coding agent, embedded in your product
                     </h1>
                     <p>
-                      Nanocodex packages Codex lifecycle and context management
-                      behind an ergonomic Rust API, so you can bring the agent
-                      loop into your own applications without bringing along an
-                      entire product.
+                      Nanocodex packages the full coding loop—persistent
+                      Responses sessions, typed history, tools, context
+                      management, branches, events, and cleanup—behind small
+                      APIs for Rust, JavaScript, browser applications, and
+                      Python. It is built for one OpenAI model family, so your
+                      team can own the product instead of rebuilding the agent.
+                    </p>
+                    <div className="header-actions home-actions">
+                      <a className="button button--high" href="/docs/">
+                        Read the docs <ChevronRight aria-hidden="true" />
+                      </a>
+                      <a
+                        className="button button--medium"
+                        href="https://github.com/gakonst/nanocodex"
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        View on GitHub <ArrowUpRight aria-hidden="true" />
+                      </a>
+                    </div>
+                    <p className="eyebrow">
+                      Rust · Node · Browser + React · Python
                     </p>
                   </header>
 
-                  <Suspense
-                    fallback={
-                      <section
-                        className="agent-tui agent-tui-loading"
-                        aria-label="Nanocodex terminal"
-                        aria-busy="true"
-                      >
-                        Loading agent…
-                      </section>
-                    }
+                  <section
+                    className="home-copy home-demo"
+                    id="agent-demo"
+                    aria-labelledby="agent-demo-title"
                   >
-                    <AgentTerminal />
-                  </Suspense>
+                    <div className="home-section-heading">
+                      <div>
+                        <p className="eyebrow">Live browser agent</p>
+                        <h2 id="agent-demo-title">
+                          The agent, not a chat wrapper.
+                        </h2>
+                      </div>
+                      <p>
+                        This is the real Rust engine compiled to WebAssembly,
+                        owned by a browser Worker and rendered through the
+                        headless React bindings. Give it a key and work in the
+                        embedded coding workspace below.
+                      </p>
+                    </div>
+                    <Suspense fallback={null}>
+                      <AgentTerminal />
+                    </Suspense>
+                  </section>
+
+                  <section
+                    className="home-copy home-capabilities"
+                    aria-labelledby="home-capabilities-title"
+                  >
+                    <div className="home-section-heading">
+                      <div>
+                        <p className="eyebrow">The complete loop</p>
+                        <h2 id="home-capabilities-title">
+                          Own the experience. Embed the hard parts.
+                        </h2>
+                      </div>
+                      <p>
+                        Nanocodex keeps model-facing behavior coherent while
+                        leaving tools, interfaces, infrastructure, and product
+                        policy with the application that can make those choices.
+                      </p>
+                    </div>
+
+                    <div className="home-release-grid home-capability-grid">
+                      <article>
+                        <span>01 / Session</span>
+                        <h3>One agent across four application surfaces</h3>
+                        <p>
+                          Start with <code>Nanocodex::builder</code> in Rust,
+                          <code> Agent.create</code> in Node or the browser, or
+                          the PyO3-backed <code>Nanocodex</code> class in Python.
+                          Each is a thin consumer of the same owned session.
+                        </p>
+                      </article>
+                      <article>
+                        <span>02 / Tools</span>
+                        <h3>Tools, Code Mode, and MCP</h3>
+                        <p>
+                          Bring caller-defined tools or use the typed workspace
+                          set. Code Mode composes them in JavaScript, while
+                          deferred <code>tool_search</code> keeps large built-ins
+                          and remote MCP servers out of the initial model prefix.
+                        </p>
+                      </article>
+                      <article>
+                        <span>03 / Context</span>
+                        <h3>Branches and reusable task-tree subagents</h3>
+                        <p>
+                          Spawn a fresh agent, fork the latest result, or branch
+                          from an earlier completed turn without asking callers
+                          to replay history. The optional task-tree extension,
+                          extracted from Tact, adds parallel specialist work
+                          without turning the core into a scheduler.
+                        </p>
+                      </article>
+                      <article>
+                        <span>04 / Web</span>
+                        <h3>Web agents and browser workspaces</h3>
+                        <p>
+                          Run the Rust lifecycle inside a browser Worker, wire it
+                          to <code>nanocodex-react</code>, and render the
+                          virtualized terminal or your own workspace. Optional
+                          experimental browser tools add deterministic Chromium
+                          automation, passkeys, screenshots, traces, and
+                          diagnostics.
+                        </p>
+                      </article>
+                      <article>
+                        <span>05 / Isolation</span>
+                        <h3>Retained VMs and hosted sandboxes</h3>
+                        <p>
+                          The experimental VM crate routes canonical workspace
+                          tools through one retained libkrun guest. Cloudflare
+                          Sandbox and Rivet AgentOS examples show caller-owned
+                          isolated files, processes, and live previews.
+                        </p>
+                      </article>
+                      <article>
+                        <span>06 / Interfaces</span>
+                        <h3>Durability, voice, and durable deployments</h3>
+                        <p>
+                          Attach the Rust-owned journal for deduplication,
+                          checkpoints, and recovery; add experimental GPT
+                          Realtime voice; or deploy the WASM agent inside a
+                          resumable Workflow, Durable Object, or Rivet Actor.
+                        </p>
+                      </article>
+                    </div>
+                  </section>
+
+                  <section
+                    className="home-copy home-api-section"
+                    aria-labelledby="home-api-title"
+                  >
+                    <div className="home-section-heading">
+                      <div>
+                        <p className="eyebrow">Deliberate APIs</p>
+                        <h2 id="home-api-title">Start at the boundary you own.</h2>
+                      </div>
+                      <p>
+                        Typed builders expose product policy. WebSocket tasks,
+                        queues, replay bookkeeping, and mutable run state stay
+                        inside the agent.
+                      </p>
+                    </div>
+                    <div className="home-release-grid home-api-grid">
+                      <article>
+                        <span>Rust</span>
+                        <code>Nanocodex::builder(openai)</code>
+                        <p>Alloy-style facade, typed turns, Tower middleware.</p>
+                      </article>
+                      <article>
+                        <span>JavaScript</span>
+                        <code>{"Agent.create({ ... })"}</code>
+                        <p>Viem-style actions for Node and browser WASM.</p>
+                      </article>
+                      <article>
+                        <span>Browser</span>
+                        <code>{"createConfig({ worker })"}</code>
+                        <p>Headless React ownership and an accessible TUI.</p>
+                      </article>
+                      <article>
+                        <span>Python</span>
+                        <code>Nanocodex(api_key)</code>
+                        <p>Native Rust lifecycle in a typed Python package.</p>
+                      </article>
+                    </div>
+                    <a className="text-action" href="/docs/">
+                      Compare APIs and build an agent
+                      <ChevronRight aria-hidden="true" />
+                    </a>
+                  </section>
+
+                  <section
+                    className="home-copy home-built-section"
+                    aria-labelledby="home-built-title"
+                  >
+                    <div className="home-section-heading">
+                      <div>
+                        <p className="eyebrow">Built with Nanocodex</p>
+                        <h2 id="home-built-title">The SDK is the starting point.</h2>
+                      </div>
+                      <p>
+                        Real products keep their own interface, persistence,
+                        memory, authorization, and deployment policy while
+                        reusing the same agent lifecycle.
+                      </p>
+                    </div>
+                    <div className="home-release-grid home-case-grid">
+                      <article>
+                        <span>Tact</span>
+                        <a href="/docs/examples/tact">
+                          A complete terminal coding agent
+                          <ArrowUpRight aria-hidden="true" />
+                        </a>
+                        <p>
+                          Tact builds its TUI, durable sessions, explicit memory,
+                          skills, reflection, and review workflows around
+                          Nanocodex sessions, tools, branches, and events.
+                        </p>
+                      </article>
+                      <article>
+                        <span>Vercel Workflow + wterm</span>
+                        <a
+                          href="https://github.com/gakonst/nanocodex/tree/master/examples/vercel-workflows"
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          A durable agent with a live workspace terminal
+                          <ArrowUpRight aria-hidden="true" />
+                        </a>
+                        <p>
+                          Workflow retains the agent stream, Vercel Sandbox
+                          persists files, and wterm attaches an operator shell
+                          without becoming a second agent protocol.
+                        </p>
+                      </article>
+                    </div>
+                  </section>
+
+                  <section
+                    className="home-copy home-proof-section"
+                    aria-labelledby="home-proof-title"
+                  >
+                    <div className="home-section-heading">
+                      <div>
+                        <p className="eyebrow">Evidence over intuition</p>
+                        <h2 id="home-proof-title">
+                          The proof ships beside the SDK.
+                        </h2>
+                      </div>
+                      <p>
+                        VM-backed benchmarks run real coding tasks against
+                        canonical verifiers. Nanocodex retains the exact
+                        trajectory, tool activity, usage, cost, and failure
+                        evidence—and publishes the board here.
+                      </p>
+                    </div>
+                    <div className="home-release-grid home-proof-grid">
+                      <article>
+                        <span>Results</span>
+                        <a
+                          href={threadSurfacePath("evals")}
+                          onFocus={preloadEvalOverview}
+                          onPointerEnter={preloadEvalOverview}
+                          onClick={(event) => {
+                            event.preventDefault();
+                            navigateToSurface("evals");
+                          }}
+                        >
+                          Open live evals <ArrowUpRight aria-hidden="true" />
+                        </a>
+                        <p>
+                          Worksets, treatments, task outcomes, and retained case
+                          evidence.
+                        </p>
+                      </article>
+                      <article>
+                        <span>Implementation</span>
+                        <a
+                          href={threadSurfacePath("code")}
+                          onClick={(event) => {
+                            event.preventDefault();
+                            navigateToSurface("code");
+                          }}
+                        >
+                          Inspect the source <ArrowUpRight aria-hidden="true" />
+                        </a>
+                        <p>
+                          The published repository tree behind the agent and
+                          evaluation loop.
+                        </p>
+                      </article>
+                      <article>
+                        <span>Record</span>
+                        <a
+                          href={threadSurfacePath("commits")}
+                          onClick={(event) => {
+                            event.preventDefault();
+                            navigateToSurface("commits");
+                          }}
+                        >
+                          Read every change <ArrowUpRight aria-hidden="true" />
+                        </a>
+                        <p>
+                          Searchable patches connect product claims to the work
+                          that landed.
+                        </p>
+                      </article>
+                    </div>
+                  </section>
 
                   <section
                     className="home-release-section"
@@ -640,8 +916,8 @@ function NanocodexShell() {
                         <span>Embed</span>
                         <code>cargo add nanocodex</code>
                         <p>
-                          All seven public Rust crates ship together under one
-                          version in dependency order.
+                          The facade and its focused Rust crates ship together
+                          under one version.
                         </p>
                       </article>
                       <article>
@@ -656,68 +932,28 @@ function NanocodexShell() {
                       </article>
                     </div>
                   </section>
-
-                  <div className="home-copy">
-                    <section>
-                      <h2>A library, not a product</h2>
-                      <ul>
-                        <li>
-                          Codex is a complete coding agent. Nanocodex isolates
-                          the reusable engine: model lifecycle, conversation
-                          context &amp; the exact tool boundary.
-                        </li>
-                        <li>
-                          The core intentionally does not ship subagents, skills
-                          or on-disk history. Your application owns orchestration,
-                          persistence &amp; product policy.
-                        </li>
-                        <li>
-                          The library-first architecture is designed for native
-                          Rust applications, WebAssembly in the browser &amp;
-                          Python bindings through PyO3.
-                        </li>
-                      </ul>
-                    </section>
-
-                    <section>
-                      <h2>What we optimize for</h2>
-                      <ul>
-                        <li>
-                          Production-grade Rust patterns. Tower middleware keeps
-                          cross-cutting behavior composable &amp; application-specific
-                          extensions straightforward.
-                        </li>
-                        <li>
-                          Conversation forks as a first-class primitive, so
-                          branching from shared context is fast &amp; efficient.
-                        </li>
-                        <li>
-                          Eval-driven development. Every vertical slice runs on
-                          real tasks, with failures traced through the verifier
-                          &amp; complete tool trajectory.
-                        </li>
-                      </ul>
-                    </section>
-                  </div>
-
                 </article>
             </section>
           ) : surface === "code" ? snapshot ? (
             <Suspense fallback={null}>
               <PierreWorkerProvider>
-                <CodeBrowser
-                  ref={codeBrowserRef}
-                  files={snapshot.tree}
-                  treeInput={snapshot.treeInput}
-                  branch={snapshot.repository.branch}
-                  head={snapshot.repository.head}
-                  theme={theme}
-                />
+                  <CodeBrowser
+                    key={snapshot.repository.head}
+                    ref={codeBrowserRef}
+                    files={snapshot.tree}
+                    branch={snapshot.repository.branch}
+                    head={snapshot.repository.head}
+                    readFile={snapshot.readFile}
+                    theme={theme}
+                  />
               </PierreWorkerProvider>
             </Suspense>
           ) : (
-            <RepositorySurfaceLoading failed={repositoryLoadError} />
-          ) : surface === "commits" ? snapshot ? (
+            <RepositorySurfaceError
+              failed={repositoryLoadError}
+              onRetry={refreshRepository}
+            />
+          ) : surface === "commits" ? snapshot?.historyLoaded ? (
             <Suspense fallback={null}>
               <PierreWorkerProvider>
                 <section
@@ -805,7 +1041,7 @@ function NanocodexShell() {
                     </div>
                   ) : null}
 
-                  <Suspense fallback={<div className="commit-list" />}>
+                  <Suspense fallback={null}>
                     <VirtualCommitList
                       commits={filteredCommits}
                       selectedHash={selected?.hash}
@@ -827,7 +1063,10 @@ function NanocodexShell() {
               </PierreWorkerProvider>
             </Suspense>
           ) : (
-            <RepositorySurfaceLoading failed={repositoryLoadError} />
+            <RepositorySurfaceError
+              failed={repositoryLoadError}
+              onRetry={refreshRepository}
+            />
           ) : surface === "requests" ? (
             <section
               className="requests-empty page-grid"
@@ -842,7 +1081,7 @@ function NanocodexShell() {
               </p>
             </section>
           ) : (
-            <Suspense fallback={<section className="eval-surface-loading" aria-busy="true">Loading evals…</section>}>
+            <Suspense fallback={null}>
               <Evals />
             </Suspense>
           )}
@@ -928,11 +1167,13 @@ function NanocodexShell() {
               </button>
               <p className="eyebrow">MPP proposal gate · testnet preview</p>
               <h2 id="proposal-title">Propose a change</h2>
-              {!snapshot || !selected ? (
+              {!snapshot ? repositoryLoadError ? (
                 <p className="proposal-intro">
-                  {repositoryLoadError
-                    ? "Repository data is unavailable."
-                    : "Loading repository…"}
+                  The thread repository is unavailable. Return to the agent workspace and retry the pull.
+                </p>
+              ) : null : !selected ? (
+                <p className="proposal-intro">
+                  Commit and push the thread workspace before proposing a change.
                 </p>
               ) : proposalState === "payment-required" ? (
                 <div className="payment-required">

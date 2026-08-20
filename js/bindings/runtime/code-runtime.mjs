@@ -1,32 +1,64 @@
 export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
+  const activeExecutions = new Set();
   const stores = new Map();
+  const providers = [];
   let nextCallId = 1;
   const definitions = [];
   const configuredTools = [];
+  const toolByName = new Map();
 
-  for (const [name, tool] of Object.entries(toolConfiguration)) {
-    if (!tool || typeof tool.handler !== "function") {
-      throw new TypeError(`tool ${name} requires a handler function`);
+  function addTools(configuration = {}) {
+    for (const [name, tool] of Object.entries(configuration)) {
+      if (toolByName.has(name)) {
+        throw new Error(`tool is already configured: ${name}`);
+      }
+      addTool(name, tool, { configuredTools, definitions, toolByName });
     }
-    configuredTools.push(Object.freeze({ handler: tool.handler, name }));
-    definitions.push(deepFreeze({
-      type: "function",
-      name,
-      description: tool.description || "Application-defined tool.",
-      strict: false,
-      parameters: jsonSnapshot(tool.parameters || {
-        type: "object",
-        additionalProperties: true,
-      }, `tool ${name} parameters`),
-    }));
   }
-  Object.freeze(configuredTools);
-  Object.freeze(definitions);
-  const encodedDefinitions = JSON.stringify(definitions);
-  const toolByName = new Map(configuredTools.map((tool) => [tool.name, tool]));
+  addTools(toolConfiguration);
+
+  function currentDefinitions() {
+    return [
+      ...definitions,
+      ...providers.flatMap((provider) => provider.definitions()),
+    ];
+  }
+
+  function currentCodeDefinitions() {
+    return currentDefinitions().map((definition) => definition.type === "tool_search"
+      ? deepFreeze({
+          type: "function",
+          name: "tool_search",
+          description: definition.description,
+          strict: false,
+          parameters: jsonSnapshot(definition.parameters, "tool_search parameters"),
+        })
+      : definition);
+  }
+
+  function currentTools() {
+    const tools = [...configuredTools];
+    for (const provider of providers) {
+      for (const definition of provider.definitions()) {
+        const name = definition.type === "tool_search" ? "tool_search" : definition.name;
+        const tool = provider.resolve(name);
+        if (tool) tools.push(tool);
+      }
+    }
+    return tools;
+  }
+
+  function resolveTool(name) {
+    const configured = toolByName.get(name);
+    if (configured) return configured;
+    for (const provider of providers) {
+      const tool = provider.resolve(name);
+      if (tool) return tool;
+    }
+  }
 
   async function executeTool(name, encodedInput, sessionId = "default", callId = "tool") {
-    const tool = toolByName.get(name);
+    const tool = resolveTool(name);
     if (!tool) return encodeToolOutput(`unknown application tool: ${name}`, false, null);
     let input;
     try {
@@ -34,11 +66,21 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
     } catch (error) {
       return encodeToolOutput(`invalid tool input: ${errorMessage(error)}`, false, null);
     }
+    const controller = new AbortController();
+    const execution = { callId, controller, sessionId };
+    activeExecutions.add(execution);
     try {
-      const result = await tool.handler(input, { sessionId, parentCallId: "", callId });
+      const result = await tool.handler(input, {
+        sessionId,
+        parentCallId: "",
+        callId,
+        signal: controller.signal,
+      });
       return encodeToolOutput(outputBody(result), true, structuredResult(result, `tool ${name} result`));
     } catch (error) {
       return encodeToolOutput(errorMessage(error), false, null);
+    } finally {
+      activeExecutions.delete(execution);
     }
   }
 
@@ -48,8 +90,13 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
     const stored = stores.get(sessionId) || new Map();
     stores.set(sessionId, stored);
     const nestedCalls = [];
+    const controller = new AbortController();
+    const execution = { callId: parentCallId, controller, sessionId };
+    activeExecutions.add(execution);
     const tools = Object.create(null);
-    for (const { handler, name } of configuredTools) {
+    const availableTools = currentTools();
+    const availableDefinitions = currentCodeDefinitions();
+    for (const { handler, name } of availableTools) {
       tools[name] = async (input) => {
         const callId = `${parentCallId}/code-${nextCallId++}`;
         const toolStartedAt = performance.now();
@@ -58,29 +105,40 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
           Math.round((toolStartedAt - startedAt) * 1_000_000),
         );
         const recordedInput = clone(input) ?? null;
+        const recordedCall = {
+          call_id: callId,
+          name,
+          input: recordedInput,
+          output: "",
+          structured_result: null,
+          success: false,
+          started_after_ns: startedAfterNs,
+          duration_ns: 0,
+        };
+        // Rust records nested calls in invocation order even when parallel
+        // siblings finish out of order. Reserve the slot before dispatch.
+        nestedCalls.push(recordedCall);
         try {
-          const result = await handler(input, { sessionId, parentCallId, callId });
-          nestedCalls.push({
-            call_id: callId,
-            name,
-            input: recordedInput,
+          if (controller.signal.aborted) throw new Error("Code Mode execution was cancelled");
+          const result = await handler(input, {
+            sessionId,
+            parentCallId,
+            callId,
+            signal: controller.signal,
+          });
+          Object.assign(recordedCall, {
             output: outputBody(result),
             structured_result: structuredResult(result, `tool ${name} result`),
             success: true,
-            started_after_ns: startedAfterNs,
             duration_ns: elapsedNs(toolStartedAt),
           });
-          return result;
+          return isToolResult(result) ? result.output : result;
         } catch (error) {
           const message = errorMessage(error);
-          nestedCalls.push({
-            call_id: callId,
-            name,
-            input: recordedInput,
+          Object.assign(recordedCall, {
             output: message,
             structured_result: message,
             success: false,
-            started_after_ns: startedAfterNs,
             duration_ns: elapsedNs(toolStartedAt),
           });
           throw error;
@@ -88,7 +146,6 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
       };
     }
     Object.freeze(tools);
-    const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
     const EXIT = Symbol("exit");
 
     function text(value) {
@@ -127,32 +184,19 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
     }
 
     try {
-      const script = new AsyncFunction(
-        "tools",
-        "ALL_TOOLS",
-        "text",
-        "image",
-        "generatedImage",
-        "store",
-        "load",
-        "exit",
-        "require",
-        "console",
-        source,
-      );
       try {
-        await script(
+        await (extras.evaluate || evaluateNative)(source, {
           tools,
-          definitions,
+          toolDefinitions: availableDefinitions,
           text,
           image,
           generatedImage,
           store,
           load,
           exit,
-          extras.require,
-          extras.console || console,
-        );
+          require: extras.require,
+          console: extras.console || console,
+        });
       } catch (error) {
         if (error !== EXIT) throw error;
       }
@@ -167,17 +211,96 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
         success: false,
         nested_calls: nestedCalls,
       });
+    } finally {
+      activeExecutions.delete(execution);
     }
   }
 
   return Object.freeze({
+    addTools,
+    addProvider(provider) {
+      if (!provider || typeof provider.definitions !== "function" || typeof provider.resolve !== "function") {
+        throw new TypeError("a Code Mode tool provider requires definitions() and resolve(name)");
+      }
+      providers.push(provider);
+    },
     executeCode,
     executeTool,
-    toolDefinitions: () => encodedDefinitions,
+    cancel(sessionId) {
+      for (const execution of activeExecutions) {
+        if (sessionId === undefined || execution.sessionId === sessionId) {
+          execution.controller.abort();
+        }
+      }
+    },
+    toolDefinitions: () => JSON.stringify(currentDefinitions()),
+    releaseSession(sessionId) {
+      stores.delete(sessionId);
+      for (const tool of configuredTools) tool.releaseSession?.(sessionId);
+    },
     reset() {
+      for (const execution of activeExecutions) execution.controller.abort();
       stores.clear();
+      for (const tool of configuredTools) tool.dispose?.();
     },
   });
+}
+
+function addTool(name, tool, collection) {
+  if (!tool || typeof tool.handler !== "function") {
+    throw new TypeError(`tool ${name} requires a handler function`);
+  }
+  const configured = Object.freeze({
+    dispose: typeof tool.dispose === "function" ? tool.dispose : undefined,
+    handler: tool.handler,
+    name,
+    releaseSession: typeof tool.releaseSession === "function" ? tool.releaseSession : undefined,
+  });
+  collection.configuredTools.push(configured);
+  collection.toolByName.set(name, configured);
+  const definition = {
+    type: "function",
+    name,
+    description: tool.description || "Application-defined tool.",
+    strict: false,
+    parameters: jsonSnapshot(tool.parameters || {
+      type: "object",
+      additionalProperties: true,
+    }, `tool ${name} parameters`),
+  };
+  if (tool.outputSchema !== undefined) {
+    definition.output_schema = jsonSnapshot(tool.outputSchema, "tool output schema");
+  }
+  collection.definitions.push(deepFreeze(definition));
+}
+
+async function evaluateNative(source, environment) {
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  const script = new AsyncFunction(
+    "tools",
+    "ALL_TOOLS",
+    "text",
+    "image",
+    "generatedImage",
+    "store",
+    "load",
+    "exit",
+    "require",
+    "console",
+    source,
+  );
+  await script(
+    environment.tools,
+    environment.toolDefinitions,
+    environment.text,
+    environment.image,
+    environment.generatedImage,
+    environment.store,
+    environment.load,
+    environment.exit,
+    environment.require,
+    environment.console,
+  );
 }
 
 function encodeToolOutput(output, success, structuredResult) {
@@ -191,6 +314,7 @@ function encodeToolOutput(output, success, structuredResult) {
 }
 
 function outputBody(value) {
+  if (isToolResult(value)) return outputBody(value.output);
   if (Array.isArray(value) && value.every((item) => item?.type === "input_text" || item?.type === "input_image")) {
     return clone(value);
   }
@@ -221,7 +345,18 @@ function jsonSnapshot(value, label) {
 }
 
 function structuredResult(value, label) {
+  if (isToolResult(value)) return jsonSnapshot(value.structuredResult, label);
   return value === undefined ? null : jsonSnapshot(value, label);
+}
+
+const TOOL_RESULT = Symbol("nanocodex.toolResult");
+
+export function toolResult(output, structuredResult = output) {
+  return Object.freeze({ [TOOL_RESULT]: true, output, structuredResult });
+}
+
+function isToolResult(value) {
+  return Boolean(value?.[TOOL_RESULT]);
 }
 
 function deepFreeze(value) {

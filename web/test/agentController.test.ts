@@ -43,6 +43,20 @@ test("the Worker controller owns prompts, steering, cancellation, events, and cl
     sessionId: "root",
   });
 
+  await controller.handle({
+    type: "voiceLifecycle",
+    target: main,
+    id: 900,
+    action: "start",
+  });
+  assert.deepEqual(harness.realtimeLifecycle, [{ sessionId: "root", action: "start" }]);
+  assert.deepEqual(messages.shift(), {
+    type: "voiceLifecycleResult",
+    id: 900,
+    action: "start",
+    context: { workspace: "/workspace", history: [] },
+  });
+
   harness.emit("root", event("root", 1, "run.started"));
   assert.deepEqual(messages.shift(), {
     type: "event",
@@ -114,6 +128,83 @@ test("the Worker controller owns prompts, steering, cancellation, events, and cl
     error: "model failed",
   });
 
+  await controller.handle({
+    type: "artifactPrompt",
+    id: 4,
+    prompt: "Explain the selected chart",
+  });
+  assert.deepEqual(messages.shift(), {
+    type: "externalPrompt",
+    target: main,
+    id: 4,
+    prompt: "Explain the selected chart",
+  });
+  const artifactTurn = harness.turns[2]!;
+  assert.equal(artifactTurn.input, "Explain the selected chart");
+  artifactTurn.complete("explained");
+  await settle();
+  assert.deepEqual(messages.shift(), {
+    type: "turnFinished",
+    target: main,
+    id: 4,
+    message: "explained",
+  });
+
+  await controller.handle({
+    type: "voicePrompt",
+    target: main,
+    id: 5,
+    delegation: {
+      kind: "request",
+      input: "retheme the live interface",
+      transcript: [{ role: "user", text: "please do it" }],
+    },
+  });
+  assert.deepEqual(messages.shift(), {
+    type: "externalPrompt",
+    target: main,
+    id: 5,
+    prompt: "delegated:retheme the live interface:user: please do it",
+    intent: "immediate",
+  });
+  const voiceTurn = harness.turns[3]!;
+  assert.equal(voiceTurn.input, "delegated:retheme the live interface:user: please do it");
+  voiceTurn.complete("rethemed");
+  await settle();
+  assert.deepEqual(messages.shift(), {
+    type: "turnFinished",
+    target: main,
+    id: 5,
+    message: "rethemed",
+  });
+
+  await controller.handle({
+    type: "voiceTranscript",
+    target: main,
+    speaker: "user",
+    text: "make it steampunk",
+  });
+  assert.deepEqual(messages.shift(), {
+    type: "voiceTranscript",
+    target: main,
+    speaker: "user",
+    text: "make it steampunk",
+  });
+
+  await controller.handle({
+    type: "voiceLifecycle",
+    target: main,
+    id: 901,
+    action: "stop",
+  });
+  assert.deepEqual(harness.realtimeLifecycle.at(-1), { sessionId: "root", action: "stop" });
+  assert.deepEqual(messages.shift(), {
+    type: "voiceLifecycleResult",
+    id: 901,
+    action: "stop",
+    context: { workspace: "/workspace", history: [] },
+  });
+
   await controller.dispose();
   assert.equal(harness.watchOffs, 1);
   assert.equal(harness.agents.get("root")?.disposed, 1);
@@ -123,7 +214,7 @@ test("the Worker controller owns prompts, steering, cancellation, events, and cl
     controller.handle({
       type: "prompt",
       target: main,
-      id: 4,
+      id: 6,
       prompt: "late",
       intent: "queue",
     }),
@@ -134,10 +225,12 @@ test("the Worker controller owns prompts, steering, cancellation, events, and cl
 test("MPP status follows live channel receipts without duplicate UI messages", async () => {
   const harness = new AgentHarness();
   const messages: any[] = [];
+  const starts: AgentControllerStart[] = [];
   let channelId: string | undefined;
   let cumulative = "0";
   const controller = createAgentController({
-    async createAgent(_start, tools) {
+    async createAgent(start, tools) {
+      starts.push(start);
       harness.tools = tools;
       return {
         agent: harness.createAgent("paid-root") as any,
@@ -157,8 +250,16 @@ test("MPP status follows live channel receipts without duplicate UI messages", a
     thinking: "none",
     reasoningMode: "standard",
     transport: "mpp",
+    accessKeyAddress: "0x0000000000000000000000000000000000000002",
     payerAddress: "0x0000000000000000000000000000000000000001",
   });
+  assert.deepEqual(starts, [{
+    thinking: "none",
+    reasoningMode: "standard",
+    transport: "mpp",
+    accessKeyAddress: "0x0000000000000000000000000000000000000002",
+    payerAddress: "0x0000000000000000000000000000000000000001",
+  }]);
   assert.deepEqual(
     messages.filter((message) => message.type === "mppPayment").map((message) => message.payment),
     [{
@@ -601,6 +702,7 @@ class AgentHarness {
   tools?: AgentControllerTools;
   nextTurnResultError?: Error;
   nextSteerError?: Error;
+  realtimeLifecycle: Array<{ sessionId: string; action: "start" | "stop" }> = [];
 
   createAgent(sessionId: string) {
     const agent = new FakeAgent(this, sessionId);
@@ -639,6 +741,20 @@ class FakeAgent {
       },
     };
     this.session = {
+      realtime: {
+        start: async () => {
+          this.harness.realtimeLifecycle.push({ sessionId: this.sessionId, action: "start" });
+          return { workspace: "/workspace", history: [] };
+        },
+        end: async () => {
+          this.harness.realtimeLifecycle.push({ sessionId: this.sessionId, action: "stop" });
+          return { workspace: "/workspace", history: [] };
+        },
+        delegation: (input: string, transcript: Array<{ role: string; text: string }>) =>
+          `delegated:${input}:${transcript.map(({ role, text }) => `${role}: ${text}`).join("\n")}`,
+        tailDelegation: (transcript: Array<{ role: string; text: string }>) =>
+          transcript.length ? `tail:${transcript.map(({ role, text }) => `${role}: ${text}`).join("\n")}` : undefined,
+      },
       fork: async (options?: { at?: FakeTurnResult }) => {
         this.harness.forks.push({
           source: this.sessionId,

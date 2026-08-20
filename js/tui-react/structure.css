@@ -248,7 +248,34 @@
 }
 
 .agent-tui-composer {
+  position: relative;
   min-height: 38px !important;
+}
+
+.agent-tui-composer:has(.agent-tui-voice) textarea {
+  padding-right: 9ch;
+}
+
+.agent-tui-mobile-actions {
+  display: contents;
+}
+
+.agent-tui-mobile-only {
+  display: none;
+}
+
+.agent-tui-voice {
+  position: absolute;
+  right: 0.6ch;
+  bottom: 3px;
+  min-width: 7ch;
+  height: 22px;
+  padding: 0 0.7ch;
+  border: 1px solid;
+  border-radius: 3px;
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
 }
 
 .tui-draft-preserved {
@@ -319,12 +346,51 @@
   content: "  │ ";
 }
 
-@media (max-width: 740px) {
+@media (max-width: 740px), (pointer: coarse) and (orientation: landscape) and (max-width: 950px) {
   .agent-tui {
-    height: var(--nc-mobile-height, min(680px, calc(100svh - 112px)));
-    min-height: var(--nc-mobile-min-height, 500px);
+    grid-template-rows: 22px minmax(0, 1fr) minmax(0, max-content) auto 22px;
+    height: var(--nc-mobile-height, calc(100dvh - 50px - env(safe-area-inset-bottom)));
+    min-height: var(--nc-mobile-min-height, 0);
     font-size: var(--nc-mobile-font-size, 10px);
     line-height: 16px;
+  }
+
+  .agent-tui-pending {
+    overflow-y: auto;
+  }
+
+  .tui-inline-edit textarea,
+  .agent-tui-composer textarea,
+  .agent-tui-editor textarea {
+    font-size: 16px;
+  }
+
+  .agent-tui-composer {
+    min-height: 52px !important;
+  }
+
+  .agent-tui-composer:has(.agent-tui-voice) textarea {
+    padding-right: 1ch;
+  }
+
+  .agent-tui-mobile-actions {
+    display: flex;
+    gap: 6px;
+    justify-content: flex-end;
+  }
+
+  .agent-tui-mobile-actions button,
+  .agent-tui-mobile-only {
+    display: block;
+    min-width: 52px;
+    height: 44px;
+    padding: 0 10px;
+  }
+
+  .agent-tui-voice {
+    position: static;
+    min-width: 72px !important;
+    height: 44px;
   }
 
   .agent-tui-header,

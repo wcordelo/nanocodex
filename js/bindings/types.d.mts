@@ -28,6 +28,158 @@ export type AgentOptions = {
   resume?: SessionSnapshot | undefined;
 };
 
+/** Model-visible facts for tools executing outside the embedding process. */
+export type ExecutionEnvironment = Readonly<{
+  currentDate: string;
+  timezone: string;
+  projectInstructions?: string | undefined;
+}>;
+
+/** Unsigned decimal revision. Strings preserve the complete Rust `u64` range. */
+declare const durabilityRevisionBrand: unique symbol;
+export type DurabilityRevision = string & {
+  readonly [durabilityRevisionBrand]: "NanocodexDurabilityRevision";
+};
+
+export type DurabilityStoredBatch = Readonly<{
+  revision: DurabilityRevision;
+  payload: string;
+}>;
+
+export type DurabilityStoredJournal = Readonly<{
+  revision: DurabilityRevision;
+  batches: readonly DurabilityStoredBatch[];
+}>;
+
+export type DurabilityAppendRequest = Readonly<{
+  expectedRevision: DurabilityRevision;
+  payload: string;
+}>;
+
+export type DurabilityAppendResult =
+  | Readonly<{ status: "appended"; revision: DurabilityRevision }>
+  | Readonly<{ status: "conflict"; actualRevision: DurabilityRevision }>;
+
+/** Host capability consumed by the Rust/WASM durability driver. */
+export type DurabilityStore = Readonly<{
+  load(journalId: string): DurabilityStoredJournal | Promise<DurabilityStoredJournal>;
+  append(
+    journalId: string,
+    request: DurabilityAppendRequest,
+  ): DurabilityAppendResult | Promise<DurabilityAppendResult>;
+}>;
+
+/** In-process store for hosts that carry its snapshot across durable steps. */
+export type MemoryDurabilityStore = DurabilityStore & Readonly<{
+  journalId: string;
+  snapshot(): DurabilityStoredJournal;
+}>;
+
+export type DurabilitySqliteValue = string | number | null;
+export type DurabilitySqliteRow = Record<string, DurabilitySqliteValue>;
+
+export type DurabilitySqliteQuery = <Row extends DurabilitySqliteRow>(
+  sql: string,
+  args: readonly DurabilitySqliteValue[],
+) => readonly Row[] | Promise<readonly Row[]>;
+
+export type DurabilitySqliteTransaction = <Result>(
+  callback: (query: DurabilitySqliteQuery) => Result | Promise<Result>,
+) => Result | Promise<Result>;
+
+export type SqliteDurabilityStoreOptions = Readonly<{
+  transaction: DurabilitySqliteTransaction;
+}>;
+
+/** Unsigned decimal revision for opaque ChatGPT subscription state. */
+declare const subscriptionRevisionBrand: unique symbol;
+export type SubscriptionRevision = string & {
+  readonly [subscriptionRevisionBrand]: "NanocodexSubscriptionRevision";
+};
+
+export type SubscriptionStoredValue = Readonly<{
+  revision: SubscriptionRevision;
+  payload?: string | undefined;
+}>;
+
+export type SubscriptionCommitRequest = Readonly<{
+  expectedRevision: SubscriptionRevision;
+  /** Opaque Rust-owned credential state. Hosts must store it as a secret. */
+  payload: string;
+}>;
+
+export type SubscriptionCommitResult =
+  | Readonly<{ status: "committed"; revision: SubscriptionRevision }>
+  | Readonly<{ status: "conflict"; actualRevision: SubscriptionRevision }>;
+
+/** Generic secret persistence consumed by the Rust ChatGPT lifecycle. */
+export type ChatGptSubscriptionStore = Readonly<{
+  load(id: string): SubscriptionStoredValue | Promise<SubscriptionStoredValue>;
+  compareAndSwap(
+    id: string,
+    request: SubscriptionCommitRequest,
+  ): SubscriptionCommitResult | Promise<SubscriptionCommitResult>;
+}>;
+
+export type MemoryChatGptSubscriptionStore = ChatGptSubscriptionStore & Readonly<{
+  id: string;
+  snapshot(): SubscriptionStoredValue;
+}>;
+
+export type ChatGptCredentialSeed = Readonly<{
+  accessToken: string;
+  refreshToken?: string | undefined;
+  accountId: string;
+  fedramp?: boolean | undefined;
+}>;
+
+export type ChatGptLoginStatus =
+  | Readonly<{ state: "signed_out" | "expired" }>
+  | Readonly<{
+      state: "pending";
+      verificationUrl: string;
+      userCode: string;
+      expiresAt: number;
+      pollAfterMs: number;
+    }>
+  | Readonly<{
+      state: "authenticated";
+      accountId: string;
+      expiresAt: number | null;
+    }>;
+
+export type ChatGptCredential = Readonly<{
+  kind: "chatgpt";
+  /** Resolved bearer credential. Do not retain or log it. */
+  accessToken: string;
+  accountId: string;
+  fedramp: boolean;
+  revision: SubscriptionRevision;
+}>;
+
+export type ChatGptSubscriptionHandle = Readonly<{
+  id: string;
+  startLogin(): Promise<ChatGptLoginStatus>;
+  status(): Promise<ChatGptLoginStatus>;
+  credential(): Promise<ChatGptCredential>;
+  recover(rejectedRevision: SubscriptionRevision): Promise<ChatGptCredential>;
+  logout(): Promise<void>;
+  dispose(): void;
+}>;
+
+export type ChatGptSubscriptionOptions = Readonly<{
+  id: string;
+  store: ChatGptSubscriptionStore;
+  /** Generic bounded HTTP capability; defaults to global fetch. */
+  fetch?: typeof globalThis.fetch | undefined;
+  /** Trusted initial credentials, typically imported from Codex auth.json. */
+  seed?: ChatGptCredentialSeed | undefined;
+  /** Test-only local issuer override. */
+  issuer?: string | undefined;
+  /** Browser WASM module compiled from the same nanocodex package. */
+  module?: unknown;
+}>;
+
 export type EstimatedUsdCost = Readonly<{
   usd: string;
   input_usd: string;
@@ -67,6 +219,17 @@ export type TurnUsage = Readonly<{
 export type ForkOptions = { at?: TurnResult | undefined };
 export type WatchEventsOptions = { includeAllSessions?: boolean | undefined };
 
+/** Read-only model context captured at the latest safe agent boundary. */
+export type AgentSessionContext = Readonly<{
+  workspace: string;
+  history: readonly Record<string, unknown>[];
+}>;
+
+export type RealtimeTranscriptEntry = Readonly<{
+  role: "user" | "assistant";
+  text: string;
+}>;
+
 export type EventWatcher = Readonly<{
   onEvent(listener: (event: AgentEvent) => void): () => void;
   off(): void;
@@ -78,15 +241,22 @@ export type AgentActions = {
     watch(options?: WatchEventsOptions): EventWatcher;
   };
   session: {
+    appendDeveloperMessage(text: string): Promise<AgentSessionContext>;
     compact(): Promise<void>;
     fork(options?: ForkOptions): Promise<DefaultAgent>;
     setFastMode(enabled: boolean): Promise<void>;
     setThinking(thinking: Thinking): Promise<void>;
     shutdown(): Promise<void>;
     spawn(): Promise<DefaultAgent>;
+    realtime: {
+      start(): Promise<AgentSessionContext>;
+      end(): Promise<AgentSessionContext>;
+      delegation(input: string, transcript?: readonly RealtimeTranscriptEntry[]): string;
+      tailDelegation(transcript: readonly RealtimeTranscriptEntry[]): string | undefined;
+    };
   };
   turn: {
-    prompt(options: { input: PromptInput }): Turn;
+    prompt(options: { input: PromptInput; id?: string | undefined }): Turn;
   };
 };
 
@@ -124,15 +294,113 @@ export type ToolContext = {
   callId: string;
   parentCallId: string;
   sessionId: string;
+  signal: AbortSignal;
 };
 
 export type Tool = {
   description: string;
-  parameters: Record<string, unknown>;
+  /** Runtime JSON Schema for model-generated input. Defaults to an open object. */
+  parameters?: Record<string, unknown> | undefined;
+  /** Runtime JSON Schema for the resolved handler value shown to Code Mode. */
+  outputSchema?: Record<string, unknown> | undefined;
   handler(input: unknown, context: ToolContext): unknown | Promise<unknown>;
+  /** Releases state owned by one completed agent session. */
+  releaseSession?(sessionId: string): void;
+  /** Releases all retained tool state when the owning host shuts down. */
+  dispose?(): void;
 };
 
 export type ToolMap = Record<string, Tool>;
+
+export type NamedTool = Tool & Readonly<{ name: string }>;
+
+/** Static JavaScript tools, optionally composed with Rust-backed extensions. */
+export type ToolConfiguration<Extension = never> =
+  | ToolMap
+  | readonly (NamedTool | Extension)[];
+
+export type CodeEvaluatorEnvironment = {
+  tools: Readonly<Record<string, (input: unknown) => Promise<unknown>>>;
+  toolDefinitions: readonly Record<string, unknown>[];
+  text(value: unknown): void;
+  image(value: unknown, detail?: string): void;
+  generatedImage(value: unknown): void;
+  store(key: string, value: unknown): void;
+  load(key: string): unknown;
+  exit(): never;
+  require?: unknown;
+  console?: Console;
+};
+
+export type CodeEvaluator = (
+  source: string,
+  environment: CodeEvaluatorEnvironment,
+) => void | Promise<void>;
+
+export type McpPayment = {
+  /** MPPx client methods, such as `tempo.session({ account, getClient, channelStore })`. */
+  methods: readonly unknown[];
+  /** Optional MPP method context forwarded for each paid MCP tool call. */
+  context?: unknown;
+  /** Called before MPPx creates a payment credential. */
+  onPaymentRequired?: ((challenge: unknown) => boolean | Promise<boolean>) | undefined;
+  orderChallenges?: ((challenges: readonly unknown[]) => readonly unknown[] | Promise<readonly unknown[]>) | undefined;
+  paymentPreferences?: unknown;
+};
+
+export type McpClient = {
+  listTools(params?: { cursor?: string | undefined }, options?: Record<string, unknown>): Promise<{
+    tools: readonly McpTool[];
+    nextCursor?: string | undefined;
+  }>;
+  callTool(
+    params: { name: string; arguments?: Record<string, unknown> | undefined },
+    resultSchema?: unknown,
+    options?: Record<string, unknown>,
+  ): Promise<unknown>;
+  listResources?(
+    params?: { cursor?: string | undefined },
+    options?: Record<string, unknown>,
+  ): Promise<{
+    resources: readonly Record<string, unknown>[];
+    nextCursor?: string | undefined;
+  }>;
+  listResourceTemplates?(
+    params?: { cursor?: string | undefined },
+    options?: Record<string, unknown>,
+  ): Promise<{
+    resourceTemplates: readonly Record<string, unknown>[];
+    nextCursor?: string | undefined;
+  }>;
+  readResource?(
+    params: { uri: string },
+    options?: Record<string, unknown>,
+  ): Promise<Record<string, unknown>>;
+};
+
+export type McpTool = {
+  name: string;
+  title?: string | undefined;
+  description?: string | undefined;
+  inputSchema?: Record<string, unknown> | undefined;
+};
+
+export type McpServer = {
+  /** Public Streamable HTTP MCP endpoint. Omit when supplying an initialized client. */
+  url?: string | URL | undefined;
+  /** Existing MCP SDK-compatible client; Nanocodex does not close caller-owned clients. */
+  client?: McpClient | undefined;
+  description?: string | undefined;
+  headers?: HeadersInit | undefined;
+  fetch?: typeof globalThis.fetch | undefined;
+  payment?: McpPayment | undefined;
+  enabledTools?: readonly string[] | undefined;
+  disabledTools?: readonly string[] | undefined;
+  startupTimeoutMs?: number | undefined;
+  timeoutMs?: number | undefined;
+};
+
+export type McpServers = Record<string, string | URL | McpServer>;
 
 /** A paid WebSocket session, such as an mppx Tempo session manager. */
 export type MppSession = {

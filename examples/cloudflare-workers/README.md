@@ -10,7 +10,7 @@ client WebSocket ──> Worker router ──> one NanocodexSession object per s
                                          ├─ Rust/WASM Nanocodex driver
                                          ├─ persistent model WebSocket
                                          ├─ hibernatable client sockets
-                                         ├─ SQLite snapshot + terminal turns
+                                         ├─ opaque Rust journal batches in SQLite
                                          └─ Cloudflare Sandbox DO + container
                                               └─ /workspace mounted to per-session R2 prefix
 
@@ -21,17 +21,18 @@ ChatGPT subscription ───────────────> one Nanocode
 ```
 
 Hot follow-on turns reuse the same WASM agent, cache identity, typed history,
-and upstream socket. Each completed turn atomically commits its Nanocodex
-snapshot and terminal client result. Failed partial turns never enter durable
-history. Repeating a completed client turn ID returns the stored terminal result
-without another model call; duplicates received during cold initialization are
-coalesced before the first await for the same reason.
+and upstream socket. The Durable Object supplies only atomic load and
+compare-and-append over opaque batches. Rust/WASM owns operation deduplication,
+typed checkpoints, model-step replay, and tool-step ambiguity. Repeating a
+completed client turn ID returns the Rust-journaled terminal result without
+another model call; an unsafe tool whose completion was not committed is
+reported as ambiguous and is never silently executed twice.
 
 An outbound WebSocket prevents a Durable Object from hibernating while it is
 retained. A one-shot idle alarm therefore shuts down Nanocodex after 30 seconds
 (configurable), closing the OpenAI socket. Client WebSockets use Cloudflare's
 hibernation API and remain connected. Their next command wakes the object and
-resumes complete client-owned typed history from SQLite. See Cloudflare's
+rebuilds complete client-owned typed history from the Rust journal in SQLite. See Cloudflare's
 [Durable Object lifecycle](https://developers.cloudflare.com/durable-objects/concepts/durable-object-lifecycle/)
 and [WebSocket hibernation](https://developers.cloudflare.com/durable-objects/best-practices/websockets/)
 documentation for the underlying behavior.
@@ -117,10 +118,11 @@ active turn or replays its committed terminal result. Use `/status` or `/exit`
 at the prompt. Set `NANOCODEX_REPL_STATE` to isolate another local REPL state
 file.
 
-This demonstrates durable client detachment, not distributed exactly-once
-inference. If the Worker process itself dies before a turn commits, reopening
-the REPL resubmits the same turn from the last committed snapshot; a partial
-provider response cannot be resumed.
+This demonstrates durable client detachment plus step recovery, not a claim
+that arbitrary external effects are magically exactly once. A completed model
+step is replayed from the journal after Worker loss. A tool start without a
+committed completion stops with an explicit ambiguous-outcome error so the
+application can reconcile the external system before retrying.
 
 `smoke:sandbox` bypasses the model and directly attacks the same bounded tool
 handlers used by the agent. It checks write/exec/read/list behavior, non-zero
@@ -155,6 +157,13 @@ forbid `eval` and `new Function`. This retains Nanocodex's typed Rust tool
 lifecycle and caller-defined handlers without shipping a JavaScript evaluator.
 Node-based consumers may continue to use Code Mode when their host permits it.
 
+Set `WEB_TOOL_URL` to install the standard `web__run` definition from
+`nanocodex/tools` directly in each Durable Object agent. The binding repairs
+common malformed model argument shapes and posts `{ commands, session_id }` to
+that HTTPS endpoint; the Worker retains endpoint credentials in the optional
+`WEB_TOOL_TOKEN` secret. No browser OPFS or shell code enters this server-side
+Worker graph.
+
 ## Validate and deploy
 
 ```sh
@@ -187,6 +196,7 @@ capability-gated relay on such a host:
 
 ```sh
 NANOCODEX_EGRESS_PORT=8791 \
+NANOCODEX_EGRESS_CAPABILITY="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')" \
   npm run relay:subscription --prefix examples/cloudflare-workers
 ```
 
@@ -196,7 +206,9 @@ For a disposable personal demo, a Cloudflare Quick Tunnel can expose the local
 port; use a stable relay under your control for anything long-lived. The relay
 still requires the Worker's bearer credential in addition to the unguessable
 path, never reads `auth.json`, bounds queued data, and forwards only the
-allowlisted handshake headers. Rotate the route by restarting it.
+allowlisted handshake headers. Set `NANOCODEX_EGRESS_CAPABILITY` from a
+protected service environment file to keep the route stable across supervised
+restarts; omit it to generate a new route.
 
 The real edge validation for this example used only the current subscription
 access token and account ID—no API key and no refresh token—and completed three

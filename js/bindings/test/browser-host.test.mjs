@@ -69,6 +69,13 @@ test("browser host directly dispatches tools without dynamic code evaluation", a
   assert.deepEqual(result.structured_result, { runtime: "worker", call_id: "call-1" });
 });
 
+test("browser host never flattens remote MCP tools into direct mode", () => {
+  assert.throws(
+    () => createBrowserHost({ mcp: { fixture: { client: {} } }, toolMode: "direct" }),
+    /remote MCP requires Code Mode/,
+  );
+});
+
 test("browser host reports non-JSON tool results as failures", async () => {
   const host = createBrowserHost({
     tools: {
@@ -93,6 +100,43 @@ test("browser host reports non-JSON tool results as failures", async () => {
   assert.match(direct.output, /JSON-serializable/);
 });
 
+test("browser host cancellation is scoped to one session", async () => {
+  const started = new Map();
+  const host = createBrowserHost({
+    tools: {
+      blocked: {
+        parameters: { type: "object" },
+        handler(_input, context) {
+          started.get(context.sessionId)?.();
+          return new Promise((_resolve, reject) => {
+            context.signal.addEventListener(
+              "abort",
+              () => reject(new Error(`${context.sessionId} cancelled`)),
+              { once: true },
+            );
+          });
+        },
+      },
+    },
+  });
+  const startA = new Promise((resolve) => started.set("session-a", resolve));
+  const startB = new Promise((resolve) => started.set("session-b", resolve));
+  const callA = host.executeTool("blocked", "{}", "session-a", "call-a");
+  const callB = host.executeTool("blocked", "{}", "session-b", "call-b");
+  await Promise.all([startA, startB]);
+  host.cancelCode("session-a");
+  const resultA = JSON.parse(await callA);
+  assert.equal(resultA.success, false);
+  assert.match(resultA.output, /session-a cancelled/);
+  const stillPending = await Promise.race([
+    callB.then(() => false),
+    new Promise((resolve) => setTimeout(() => resolve(true), 10)),
+  ]);
+  assert.equal(stillPending, true);
+  host.cancelCode("session-b");
+  assert.match(JSON.parse(await callB).output, /session-b cancelled/);
+});
+
 test("browser host opens application sockets through MPP", async () => {
   const socket = new FakeWebSocket("wss://paid.test");
   socket.readyState = FakeWebSocket.OPEN;
@@ -112,6 +156,12 @@ test("browser host opens application sockets through MPP", async () => {
   assert.equal(JSON.parse(await host.next(1, 10)).text, '{"type":"paid"}');
   assert.equal(JSON.parse(await host.send(1, "request")).ok, true);
   assert.deepEqual(socket.sent.map(JSON.parse), [{ mpp: "message", data: "request" }]);
+  socket.close(3008, "requested voucher amount exceeds local maxDeposit");
+  assert.deepEqual(JSON.parse(await host.next(1, 10)), {
+    kind: "error",
+    detail: "MPP WebSocket payment flow failed with code 3008: requested voucher amount exceeds local maxDeposit",
+    reconnectable: false,
+  });
 });
 
 test("browser host does not require a global constructor for host-owned sockets", async () => {
@@ -455,10 +505,10 @@ class FakeWebSocket {
   }
 
   send(message) { this.sent.push(message); }
-  close(code) {
+  close(code, reason = "") {
     this.readyState = 3;
     this.closedCode = code;
-    this.emit("close", { code });
+    this.emit("close", { code, reason });
   }
 
   emit(type, event) {

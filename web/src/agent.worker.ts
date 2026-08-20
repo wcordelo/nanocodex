@@ -1,15 +1,14 @@
-import { Agent } from "nanocodex/browser";
+import { Agent, Transport } from "nanocodex/browser";
 import {
   createAgentController,
   type AgentControllerStart,
   type AgentControllerTools,
 } from "./agentController";
-import { createBrowserTools } from "./browserTools";
 import type { WebTuiCommand } from "./nanocodex";
 import { createPaymentSessionOwner } from "./paymentSessionOwner";
-import { MPP_RESPONSES_WEBSOCKET_URL } from "./tempo-policy";
+import { MPP_RESPONSES_WEBSOCKET_URL } from "./tempo-constants";
 
-type IncomingMessage = WebTuiCommand;
+type IncomingMessage = WebTuiCommand | { type: "warmup" };
 type PaymentSession = Awaited<ReturnType<(typeof import("./tempo"))["createTempoMppSession"]>>;
 const CHATGPT_API_BASE_URL = "https://chatgpt.com/backend-api/codex";
 
@@ -29,6 +28,12 @@ const controller = createAgentController({
 let commands = Promise.resolve();
 
 worker.onmessage = ({ data }: MessageEvent<IncomingMessage>) => {
+  if (data.type === "warmup") {
+    commands = commands.then(() => Agent.prewarm()).catch((error) => {
+      console.warn(error);
+    });
+    return;
+  }
   commands = commands
     .then(() => controller.handle(data))
     .catch((error) => {
@@ -44,39 +49,55 @@ async function createAgent(
   tools: AgentControllerTools,
 ) {
   await paymentSessions.clear();
-  const common = {
-    tools: {
-      ...createBrowserTools({
-        recentImages: tools.recentImages,
-        rememberImage: tools.rememberImage,
-      }),
-      browserInfo: {
-        description: "Return basic information about the browser Worker runtime.",
-        parameters: { type: "object", additionalProperties: false },
-        handler: async () => ({
-          language: navigator.language,
-          online: navigator.onLine,
-          userAgent: navigator.userAgent,
-        }),
+  const origin = worker.location.origin;
+  const toolHeaders = { "x-nanocodex-request": "1" };
+  const [runtime, mcpModule] = await Promise.all([
+    import("nanocodex/tools/browser").then(({ browser }) => browser({
+      threadId: start.threadId!,
+      origin,
+      web: {
+        url: new URL("/api/tools/web-search", origin),
+        headers: toolHeaders,
       },
-    },
+      images: {
+        url: new URL("/api/tools/image-generation", origin),
+        headers: toolHeaders,
+      },
+      recentImages: tools.recentImages,
+      rememberImage: tools.rememberImage,
+    })),
+    import("./browserMcp"),
+  ]);
+  const common = {
+    filesystem: runtime.filesystem,
+    filesystemTools: false,
+    instructions: runtime.instructions,
+    executionEnvironment: browserExecutionEnvironment(runtime.projectInstructions),
+    mcp: mcpModule.browserMcpConfiguration(origin),
+    tools: runtime.tools,
     thinking: start.thinking,
     reasoningMode: start.reasoningMode,
   };
   if (start.transport === "mpp") {
     const payerAddress = start.payerAddress;
+    const accessKeyAddress = start.accessKeyAddress;
     if (!payerAddress) {
       throw new Error("MPP requires a connected Tempo account");
     }
+    if (!accessKeyAddress) {
+      throw new Error("MPP requires a locally signable Tempo access key");
+    }
     const { createTempoMppSession } = await import("./tempo");
     return paymentSessions.open(
-      () => createTempoMppSession(payerAddress),
+      () => createTempoMppSession(payerAddress, accessKeyAddress),
       async (paymentSession) => {
         const agent = await Agent.create({
           ...common,
           fastMode: true,
-          mpp: paymentSession.mpp,
-          websocketUrl: MPP_RESPONSES_WEBSOCKET_URL,
+          transport: Transport.mpp({
+            session: paymentSession.provider,
+            websocketUrl: MPP_RESPONSES_WEBSOCKET_URL,
+          }),
         });
         return {
           agent,
@@ -87,40 +108,56 @@ async function createAgent(
               return paymentSession.mpp.channelId;
             },
             cumulative: () => paymentSession.mpp.cumulative.toString(),
+            mcpCumulative: () => paymentSession.mcpCumulative().toString(),
           },
         };
       },
     );
   }
-  const createWebSocket = (endpoint: string, sessionId: string) => {
-    const url = new URL(endpoint);
-    url.searchParams.set("session_id", sessionId);
-    return new WebSocket(url);
-  };
+  const createWebSocket = (endpoint: string, sessionId: string) =>
+    import("./workerManagedWebSocket").then(({ createWorkerManagedWebSocket }) =>
+      createWorkerManagedWebSocket(endpoint, sessionId)
+    );
   if (start.transport === "chatgpt") {
     return {
       agent: await Agent.create({
         ...common,
-        hostAuth: true,
-        apiBaseUrl: CHATGPT_API_BASE_URL,
-        websocketUrl: workerEndpoint(),
-        createWebSocket,
+        transport: Transport.hostManaged({
+          apiBaseUrl: CHATGPT_API_BASE_URL,
+          websocketUrl: workerEndpoint(),
+          createWebSocket,
+        }),
       }),
     };
   }
   return {
     agent: await Agent.create({
       ...common,
-      apiKey: "worker-managed",
-      websocketUrl: workerEndpoint(),
-      createWebSocket,
+      transport: Transport.openAi({
+        apiKey: "worker-managed",
+        websocketUrl: workerEndpoint(),
+        createWebSocket,
+      }),
     }),
   };
 }
 
+function browserExecutionEnvironment(projectInstructions?: string) {
+  const now = new Date();
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const currentDate = timezone
+    ? `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`
+    : now.toISOString().slice(0, 10);
+  return {
+    currentDate,
+    timezone: timezone || "Etc/UTC",
+    ...(projectInstructions === undefined ? {} : { projectInstructions }),
+  };
+}
+
 function workerEndpoint(): string {
-  const protocol = self.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${protocol}//${self.location.host}/api/responses`;
+  const protocol = worker.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${worker.location.host}/api/responses`;
 }
 
 function errorMessage(error: unknown): string {

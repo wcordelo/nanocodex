@@ -9,6 +9,7 @@ and evaluation record legible.
 - Vite + React
 - Cloudflare Vite plugin and Workers runtime
 - Wrangler for preview and deployment
+- just-bash over the thread's OPFS filesystem, with browser `git` and `gh` compatibility commands
 - Pierre Trees and Diffs for the file tree, source viewer, and the single virtualized commit stream
 - TanStack Virtual for the commit quick-jump and evaluation indexes
 - Derived job, trial, trajectory, and verifier views
@@ -35,52 +36,97 @@ history, credential policy, or model-loop state.
 The local Worker and Vite client run together at `https://localhost:5173`, using
 the same Cloudflare Vite-plugin layout as Tempo's React MPP examples.
 
-`npm run dev` and `npm run build` first regenerate
-`src/data/harness-repository.json` from the parent repository. Override the source or
-history depth with `NANOCODEX_REPO` and `NANOCODEX_COMMIT_LIMIT`. The default index
-covers the complete repository history and stores it as one streamed patch
-asset. The commit view parses complete files in bounded batches and appends
-them to one Pierre CodeView, yielding between batches so scrolling stays
-responsive.
+### Documentation
+
+The product guide lives in `docs/src/pages` and uses Vocs with full-static
+rendering under `/docs`. Run `npm run docs:dev` while writing, or `npm run
+docs:build` to generate the site, install it into `dist/client/docs`, and check
+every route plus `llms.txt` and `llms-full.txt`. The normal `npm run build`
+composes the Vite application and Vocs output into the one Cloudflare asset
+tree; the docs are not a second service or runtime.
+
+In development, Vite reads repository metadata from Git, serves working-tree
+files on demand, and streams history directly from Git only when the commit
+view opens. Startup does not generate or rewrite repository blobs. Set
+`NANOCODEX_REPO` to point the development view at another checkout.
+
+`npm run build` does not inspect Git or generate repository assets. Production
+repository data is published separately to R2 by `npm run
+publish:repository`. The publisher derives one coherent generation from a Git
+commit, uploads only previously unseen source blobs and commit patches, uploads
+one complete clone pack for exactly the advertised refs, and stores new Git
+objects once in bounded immutable pack-entry shards. The Worker streams the
+complete pack for a fresh clone, but uses the object graph and reusable shards
+to send only the closure missing from an incremental or shallow fetch. Shards
+are compacted after a bounded number of generations. Publication advances one
+Durable Object pointer only after every referenced R2 object exists, so a failed
+or concurrent publisher cannot expose mixed tree, history, or Git data. The
+commit view loads only the selected patch and parses it in bounded batches,
+yielding between batches so scrolling stays responsive.
+
+For this single-repository deployment, R2 owns immutable bytes and one Durable
+Object owns the current generation with compare-and-swap publication. D1 is
+deliberately absent: there is no repository registry, account model, search
+index, or relational query to justify it. Publishing requires the same
+`GIT_MIRROR_TOKEN` secret on the Worker and `NANOCODEX_GIT_TOKEN` in the
+publisher environment. The publisher also requires `/api/health` to attest the
+same complete Git SHA before it makes an authenticated request or uploads an
+object:
+
+```bash
+NANOCODEX_GIT_ORIGIN=https://nanocodex.me-7fb.workers.dev \
+NANOCODEX_GIT_TOKEN=... \
+npm run publish:repository
+```
+
+If the Durable Object contains an obsolete publication shape, the publisher
+stops before uploading anything. Repair it atomically after deploying the
+current Worker by explicitly opting into a current-format replacement:
+
+```bash
+NANOCODEX_GIT_ORIGIN=https://nanocodex.me-7fb.workers.dev \
+NANOCODEX_GIT_TOKEN=... \
+NANOCODEX_REPAIR_INVALID_PUBLICATION=1 \
+npm run publish:repository
+```
+
+The replacement is accepted only while the stored publication is invalid; it
+cannot overwrite a valid generation or bypass its compare-and-swap head.
+
+Production serves the website indexes, immutable file and patch objects, and a
+read-only Git protocol-v2 endpoint from that publication. Clone the mirror with
+`git clone https://nanocodex.me-7fb.workers.dev/git`. GitHub remains the write
+remote. After each current `master` commit passes CI, the website job deploys
+the exact tested Worker with that SHA, waits for `/api/health` to return it as
+`deployment_sha`, publishes the repository generation, and verifies both the
+snapshot and Git protocol advertise the same SHA. An obsolete queued CI run is
+not allowed to deploy or publish.
+
+Each browser thread owns an OPFS working tree and an `origin` Cloudflare Git
+remote on branch `nanocodex`. The Files and Commits surfaces read that thread's
+actual Git objects in the browser; file blobs and commit patches are generated
+on demand and released when the view refreshes. Push and pull notifications
+cross the page/agent Worker boundary so an open repository view can preserve
+its last complete render until the replacement snapshot is ready.
 
 ### Live eval view
 
 `/evals` is part of the same production Vite and React application as the
 Nanocodex homepage, embedded TUI, repository tree, and commit history. The
-website uses a typed HTTP client and has no SQLite or artifact-path knowledge.
-The existing evaluation coordinator owns the durable ledger and exposes its
-read-only Axum API alongside the worker routes:
+website reads its public API directly from the Cloudflare Worker. D1 owns the
+task board and normalized result index; R2 owns task packages, case records,
+and complete evidence. There is no coordinator host, tunnel, origin override,
+or Access credential in the website read path.
 
-```bash
-cd ..
-cargo run -p nanocodex-bin -- eval coordinator dx-distributed-k2 \
-  --config nanocodex.dx-sweep.toml \
-  --state-dir ~/.nanocodex/evals \
-  --port 8788
-```
-
-For development, the local Worker proxies `/api/evals` to
-`http://127.0.0.1:8788`. When the coordinator runs on another box, forward that
-loopback port before starting Vite:
-
-```bash
-ssh -N -L 127.0.0.1:8788:127.0.0.1:8788 ubuntu@dev-georgios
-```
-
-Set `EVALS_API_ORIGIN` to override the local origin. Plain HTTP is accepted only
-for a loopback origin in the development environment. In production, set
-`EVALS_API_ORIGIN` on the Cloudflare Worker to the HTTPS Cloudflare Tunnel
-hostname. Protect that hostname with Cloudflare Access and configure
-`EVALS_ACCESS_CLIENT_ID` plus the `EVALS_ACCESS_CLIENT_SECRET` Worker secret.
-The Worker forwards only same-origin GET requests under `/api/evals`; SQLite
-and retained artifacts remain on the coordinator box.
+Native benchmark hosts are disposable compute clients. They claim R2-backed
+tasks from the Worker and authenticate every mutation with
+`NANOCODEX_EVALS_WRITE_TOKEN`; they are never an authority for website reads.
 
 The API is deliberately workset-oriented: the client loads the retained
 workset index, drills into one workset's task summaries, loads one selected
 treatment matrix, then requests a single opaque case ID for terminal evidence.
 TanStack Query is the only application cache and owns polling, cancellation,
-retry, and the overview/workset/task/case query lifetimes. The coordinator and
-Cloudflare proxy add no evidence cache. There is no second eval-only HTML entry,
+retry, and the overview/workset/task/case query lifetimes. There is no second eval-only HTML entry,
 React root, Vite configuration, Node eval server, or browser-side SQL path.
 
 The homepage is also a real embedded-agent demo with three deliberately thin
@@ -92,6 +138,8 @@ layers:
 - `../js/react` publishes `nanocodex-react`, the wagmi-like headless React owner. Its provider and
   hooks manage the module Worker lifecycle, readiness, commands, and event
   subscriptions without imposing presentation policy.
+- `nanocodex/tools` owns the framework-independent live React document,
+  bounded workspace store, and typed artifact tool used by the web consumer.
 - `AgentTerminal` is the optimized Ratatui-faithful consumer: native colors,
   rendering hierarchy, queue/steer behavior, `/btw`, historical branch editing,
   branch navigation, per-branch drafts, clipboard images, and key bindings over
@@ -99,13 +147,60 @@ layers:
 
 The module Worker loads the generated `nanocodex-wasm` package, and the Rust
 engine owns the persistent Responses session, typed history, event stream, and
-tool loop. The Cloudflare Worker upgrades `/api/responses` and proxies OpenAI
+tool loop. Each thread opens one OPFS workspace shared by just-bash, Rust
+`apply_patch`, isomorphic-git, the file viewer, commit history, uploads,
+downloads, and the artifact dock. The model receives the standard
+`exec_command` and Rust `apply_patch` tools rather than separate list/read/write
+or Git tools. Shell commands include normal virtual Unix commands plus `git`
+and `gh`; `git push origin nanocodex` publishes the same objects the
+Commits view reads from the Cloudflare thread remote. Files survive agent,
+Worker, and page restarts without being copied into conversation snapshots.
+The Cloudflare Worker upgrades `/api/responses` and proxies OpenAI
 tool calls. It accepts a user-provided OpenAI key into a one-hour Durable Object
 session and returns only an opaque `HttpOnly`, `SameSite=Strict` cookie. The key
 is never placed in a URL, local storage, React state, or WASM configuration.
+
+Custom interfaces use the typed `render_artifact` tool composed by
+`nanocodex/tools/browser`, alongside `exec_command`, `web__run`, and
+`image_gen__imagegen`. The tool accepts JavaScript source defining a real React
+`App`; `React`, an `html` tagged-template helper, and `sendPrompt` are supplied by the isolated iframe
+runtime. Published documents live under `.nanocodex/artifacts` in the same Git
+working tree and open in a fullscreen dock. Reusing an artifact ID replaces the
+interface in place, so voice or text turns can continuously retheme and extend
+it. Generated code has no imports, network access, or access to the parent page;
+explicit `sendPrompt` actions re-enter the normal queued prompt lifecycle.
 A user key takes precedence over the optional deployment-owned
 `OPENAI_API_KEY`; forgetting or expiring it falls back to that deployment key
 when present.
+
+The reusable `browser(...)` tool bundle gives the browser agent a bounded
+`dataset` tool. It can inspect public
+Parquet URLs, Hugging Face dataset/config/split exports, and uncompressed JSONL
+URLs without downloading whole datasets into memory. Parquet reads use HTTP
+ranges and filter/projection pushdown where possible; JSONL reads incrementally
+scan the response stream. Dataset handles are scoped to an agent session. Query
+limits and offsets accept any nonnegative safe range; input-byte and output-byte
+budgets remain bounded. Partial results report `complete: false` and an opaque
+`nextCursor` that retains projection and filters while resuming at the physical
+Parquet row batch or JSONL byte position. The implementation and Parquet codecs
+are lazy chunks, so ordinary agent sessions do not download them. Direct sources
+must permit browser CORS. Parquet sources must honor byte-range requests; JSONL
+sources must honor them when continuing from a cursor.
+
+For example, ask the web agent to “inspect the `main` config’s `train` split of
+`openai/gsm8k`, show its schema, and find five examples containing arithmetic.”
+The resulting tool flow is equivalent to:
+
+```json
+{"operation":"open","source":{"kind":"huggingface","dataset":"openai/gsm8k","config":"main","split":"train"}}
+{"operation":"query","dataset_id":"<returned id>","columns":["question","answer"],"filters":[{"column":"question","op":"contains","value":"how many"}],"limit":5}
+{"operation":"query","dataset_id":"<returned id>","cursor":"<returned nextCursor>","limit":5}
+{"operation":"close","dataset_id":"<returned id>"}
+```
+
+Run `npm run bench:dataset` in `js/bindings` for the deterministic 100,000-row
+Snappy Parquet/JSONL browser-path benchmark. It reports cold and repeated query
+latency, pulled bytes, range requests, scanned rows, and cache hits.
 
 OpenAI remains the default agent connection. A user can explicitly select
 Tempo MPP instead; only then does React lazy-load Wagmi and Tempo Accounts,
@@ -113,11 +208,15 @@ open the standard embedded Tempo Wallet dialog for its account and passkey flow,
 authorize a bounded one-day access key in that same Accounts connection
 ceremony. The
 module Worker hydrates that delegated signer from Accounts' IndexedDB storage
-and gives it to an mppx session manager with a durable channel store. The same
-MPP channel is reused across turns and reloads and is not closed by Nanocodex.
-Wallet, payer, delegated signer, channel, cumulative authorization, and the
-agent event JSONL are shown only while the MPP route is selected. The normal
-OpenAI route does not initialize or expose any payment state.
+and gives it to an mppx session manager with a durable channel store. Marking
+that manager as Nanocodex's Tempo provider also enables the package's built-in
+Mercator MCP. MPPx pays its charge or session challenges with the same signer,
+limits, and durable store; its tools remain deferred behind `tool_search` and
+Code Mode. The model channel is reused across turns and reloads and is not
+closed by Nanocodex. Wallet, payer, delegated signer, channel, model cumulative,
+Mercator cumulative, and agent event JSONL are shown only while the MPP route
+is selected. The normal OpenAI and ChatGPT routes do not initialize Mercator or
+expose any payment state.
 
 Development uses `vite-plugin-mkcert` because the Accounts SDK intentionally
 falls back to a popup on plain HTTP. Cross-origin passkeys inside the hosted
@@ -149,12 +248,41 @@ scrolling are left to Pierre CodeView and the browser's native input behavior.
 
 ## Production
 
+`master` CI can own production deployment after the `CLOUDFLARE_API_TOKEN`
+repository secret, `CLOUDFLARE_ACCOUNT_ID` repository variable, and
+`CLOUDFLARE_DEPLOY_ENABLED=true` repository variable are configured. The
+existing `NANOCODEX_GIT_TOKEN` publishes the matching repository generation.
+Without that explicit enablement, CI still validates the complete production
+graph but does not mutate the hosted Worker. Local commands build and preview
+it:
+
 ```bash
 npm run build
 npm run preview
-npm run deploy:preview
-npm run deploy
 ```
+
+For a break-glass production deployment, start from a clean commit and preserve
+the same attestation contract before running `publish:repository`:
+
+```bash
+revision=$(git rev-parse HEAD)
+npm run build
+npx wrangler deploy --strict \
+  --tag "$revision" \
+  --message "gakonst/nanocodex@$revision" \
+  --var "DEPLOYMENT_SHA:$revision"
+```
+
+Do not publish repository data until the hosted `/api/health` reports that
+exact `deployment_sha`. The publisher enforces this ordering independently. An
+authenticated operator can publish the already-deployed master revision with:
+
+```bash
+gh workflow run mirror-cloudflare-git.yml --ref master -f revision="$revision"
+```
+
+For the one-time invalid-publication repair, add
+`-f repair_invalid_publication=true` to that dispatch.
 
 The proposal endpoint is intentionally a testnet-preview `402` until a live MPP
 recipient and settlement policy are configured.

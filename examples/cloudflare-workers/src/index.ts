@@ -2,13 +2,18 @@ import { DurableObject } from "cloudflare:workers";
 import { ContainerProxy, Sandbox } from "@cloudflare/sandbox";
 import type {
   DefaultAgent,
+  DurabilitySqliteQuery,
+  DurabilitySqliteRow,
+  DurabilitySqliteValue,
+  DurabilityStore,
   EventWatcher,
   PromptInput,
-  SessionSnapshot,
   Turn,
   TurnResult,
 } from "nanocodex";
-import { Agent } from "nanocodex/browser";
+import { createSqliteDurabilityStore } from "nanocodex";
+import { Agent, Subagents, Transport } from "nanocodex/browser";
+import { web } from "nanocodex/tools";
 import nanocodexWasm from "./nanocodex.wasm";
 import {
   cloudflareSandboxTools,
@@ -37,7 +42,6 @@ import {
 const MAX_CLIENT_MESSAGE_BYTES = 1024 * 1024;
 const MAX_ACTIVE_TURNS = 16;
 const MAX_CLIENT_CONNECTIONS = 64;
-const MAX_TERMINAL_TURNS = 256;
 const OPENAI_WEBSOCKET_BETA = "responses_websockets=2026-02-06";
 const CHATGPT_WEBSOCKET_URL = "wss://chatgpt.com/backend-api/codex/responses";
 const CHATGPT_API_BASE_URL = "https://chatgpt.com/backend-api/codex";
@@ -61,18 +65,18 @@ export interface Env {
   CHATGPT_ACCOUNT_ID?: string;
   CHATGPT_FEDRAMP?: string;
   CHATGPT_REFRESH_TOKEN?: string;
-  CHATGPT_TOKEN_ENDPOINT?: string;
+  CHATGPT_ISSUER?: string;
+  WEB_TOOL_URL?: string;
+  WEB_TOOL_TOKEN?: string;
 }
 
 type SessionRow = {
   session_id: string;
   public_origin: string;
-  snapshot: string | null;
   completed_turns: number;
   last_active: number;
 };
 
-type TerminalRow = { payload: string };
 type SessionStatusRow = {
   session_id: string;
   has_snapshot: number;
@@ -242,17 +246,26 @@ export class NanocodexSession extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.ctx.storage.sql.exec(`
+      DROP TABLE IF EXISTS terminal_turns;
       CREATE TABLE IF NOT EXISTS session_state (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
         session_id TEXT NOT NULL UNIQUE,
         public_origin TEXT NOT NULL DEFAULT '',
-        snapshot TEXT,
         completed_turns INTEGER NOT NULL DEFAULT 0,
         last_active INTEGER NOT NULL
       );
-      CREATE TABLE IF NOT EXISTS terminal_turns (
-        id TEXT PRIMARY KEY,
+      CREATE TABLE IF NOT EXISTS durability_journals (
+        journal_id TEXT PRIMARY KEY,
+        revision TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS durability_batches (
+        journal_id TEXT NOT NULL,
+        revision TEXT NOT NULL,
         payload TEXT NOT NULL,
+        PRIMARY KEY (journal_id, revision)
+      );
+      CREATE TABLE IF NOT EXISTS completed_operations (
+        id TEXT PRIMARY KEY,
         completed_at INTEGER NOT NULL
       );
     `);
@@ -329,7 +342,9 @@ export class NanocodexSession extends DurableObject<Env> {
       await this.#stop();
       for (const socket of this.ctx.getWebSockets()) closeSocket(socket, 1000, "session deleted");
       this.ctx.storage.transactionSync(() => {
-        this.ctx.storage.sql.exec("DELETE FROM terminal_turns");
+        this.ctx.storage.sql.exec("DELETE FROM durability_batches");
+        this.ctx.storage.sql.exec("DELETE FROM durability_journals");
+        this.ctx.storage.sql.exec("DELETE FROM completed_operations");
         this.ctx.storage.sql.exec("DELETE FROM session_state");
       });
       await this.ctx.storage.deleteAlarm();
@@ -426,11 +441,6 @@ export class NanocodexSession extends DurableObject<Env> {
       return;
     }
 
-    const terminal = this.#terminal(command.id);
-    if (terminal) {
-      this.#sendEncoded(socket, terminal);
-      return;
-    }
     if (this.#turns.has(command.id) || this.#pendingTurnIds.has(command.id)) {
       const input = this.#turnInputs.get(command.id);
       if (input !== undefined && JSON.stringify(input) !== JSON.stringify(command.input)) {
@@ -454,7 +464,7 @@ export class NanocodexSession extends DurableObject<Env> {
     try {
       const agent = await this.#ensureAgent();
       if (this.#agent !== agent) throw new Error("agent became unavailable while accepting the turn");
-      const turn = agent.turn.prompt({ input: command.input });
+      const turn = agent.turn.prompt({ id: command.id, input: command.input });
       this.#turns.set(command.id, turn);
       this.#pendingTurnIds.delete(command.id);
       this.ctx.waitUntil(this.#complete(command.id, turn));
@@ -487,39 +497,44 @@ export class NanocodexSession extends DurableObject<Env> {
     if (authMode === "api_key" && !this.env.OPENAI_API_KEY) {
       throw new Error("OPENAI_API_KEY is not configured");
     }
-    const resume = session.snapshot === null
-      ? undefined
-      : JSON.parse(session.snapshot) as SessionSnapshot;
     const auth = this.env.NANOCODEX_AUTH.getByName("subscription");
-    const authorization = authMode === "api_key"
-      ? { apiKey: this.env.OPENAI_API_KEY! }
-      : { hostAuth: true as const };
+    const websocketUrl = this.env.OPENAI_WEBSOCKET_URL
+      ?? (authMode === "chatgpt" ? CHATGPT_WEBSOCKET_URL : undefined);
+    const transport = authMode === "api_key"
+      ? Transport.openAi({
+          apiKey: this.env.OPENAI_API_KEY!,
+          websocketUrl,
+          createWebSocket: openAiWebSocket,
+        })
+      : Transport.hostManaged({
+          apiBaseUrl: CHATGPT_API_BASE_URL,
+          websocketUrl,
+          createWebSocket: (endpoint, id, request) =>
+            openSubscriptionWebSocket(auth, endpoint, id, request),
+        });
     const agent = await Agent.create({
-      ...authorization,
+      transport,
       module: nanocodexWasm,
-      websocketUrl: this.env.OPENAI_WEBSOCKET_URL
-        ?? (authMode === "chatgpt" ? CHATGPT_WEBSOCKET_URL : undefined),
-      apiBaseUrl: authMode === "chatgpt" ? CHATGPT_API_BASE_URL : undefined,
       sessionId: session.session_id,
-      resume,
+      durability: this.#durabilityStore(),
+      durabilityId: session.session_id,
       workspace: "/workspace",
-      instructions: "You are Nanocodex running inside a Cloudflare Durable Object. Use the sandbox_* tools for code, files, and previews; their /workspace is isolated and persisted in R2 for this session.",
+      instructions: "You are Nanocodex running inside a Cloudflare Durable Object. Use the sandbox_* tools for code, files, and previews; their /workspace is isolated and persisted in R2 for this session. Delegate independent work with spawn_agent and use the task-tree communication tools to coordinate children.",
       // Workers forbid eval/new Function. Direct mode keeps caller-defined
       // tools in the WASM lifecycle while dispatching handlers through the
       // typed host bridge without dynamic code generation.
       toolMode: "direct",
-      createWebSocket: authMode === "api_key"
-        ? openAiWebSocket
-        : (endpoint, id, request) => openSubscriptionWebSocket(auth, endpoint, id, request),
-      tools: {
-        ...cloudflareSandboxTools(
+      tools: [
+        ...cloudflareWebTools(this.env),
+        ...Object.entries(cloudflareSandboxTools(
           this.env.Sandbox,
           session.session_id,
           this.env.NANOCODEX_SANDBOX_LOCAL === "true",
           session.public_origin || undefined,
           this.env.NANOCODEX_ADMIN_TOKEN,
-        ),
-        runtimeInfo: {
+        )).map(([name, tool]) => ({ name, ...tool })),
+        {
+          name: "runtimeInfo",
           description: "Return information about the current agent runtime.",
           parameters: { type: "object", additionalProperties: false },
           handler: () => ({
@@ -529,7 +544,10 @@ export class NanocodexSession extends DurableObject<Env> {
             workspace: "/workspace",
           }),
         },
-      },
+        // The imported module contains nanocodex-subagents; this spread enables
+        // its Rust-owned tools for this Durable Object's agent family.
+        ...Subagents.create({ maxConcurrency: 8 }),
+      ],
     });
     this.#events = agent.events.watch();
     this.#events.onEvent((event) => this.#broadcast({ type: "event", event }));
@@ -551,34 +569,24 @@ export class NanocodexSession extends DurableObject<Env> {
         final_message: result.finalMessage,
         usage: result.usage,
       };
-      const snapshot = JSON.stringify(result.snapshot);
       const payload = JSON.stringify(terminal);
       const completedAt = Date.now();
       try {
         this.ctx.storage.transactionSync(() => {
           this.ctx.storage.sql.exec(
-            "UPDATE session_state SET snapshot = ?, completed_turns = completed_turns + 1, last_active = ? WHERE singleton = 1",
-            snapshot,
-            completedAt,
-          );
-          this.ctx.storage.sql.exec(
-            "INSERT OR REPLACE INTO terminal_turns (id, payload, completed_at) VALUES (?, ?, ?)",
+            "INSERT OR IGNORE INTO completed_operations (id, completed_at) VALUES (?, ?)",
             id,
-            payload,
             completedAt,
           );
           this.ctx.storage.sql.exec(
-            "DELETE FROM terminal_turns WHERE id NOT IN (SELECT id FROM terminal_turns ORDER BY completed_at DESC, rowid DESC LIMIT ?)",
-            MAX_TERMINAL_TURNS,
+            `UPDATE session_state
+             SET completed_turns = (SELECT COUNT(*) FROM completed_operations), last_active = ?
+             WHERE singleton = 1`,
+            completedAt,
           );
         });
       } catch (error) {
-        // The in-memory driver has observed this completed turn, but durable
-        // state has not. Drop it so the next prompt cannot continue from a
-        // history prefix that clients cannot recover after eviction.
-        await this.#shutdownAgent();
-        this.#broadcast({ type: "turn_failed", id, error: `durable commit failed: ${errorMessage(error)}` });
-        return;
+        console.error("failed to update session telemetry", errorMessage(error));
       }
       this.#broadcastEncoded(payload);
     } finally {
@@ -620,7 +628,7 @@ export class NanocodexSession extends DurableObject<Env> {
 
   #session(): SessionRow | undefined {
     return this.ctx.storage.sql.exec<SessionRow>(
-      "SELECT session_id, public_origin, snapshot, completed_turns, last_active FROM session_state WHERE singleton = 1",
+      "SELECT session_id, public_origin, completed_turns, last_active FROM session_state WHERE singleton = 1",
     ).toArray()[0];
   }
 
@@ -632,17 +640,22 @@ export class NanocodexSession extends DurableObject<Env> {
 
   #sessionStatus(): SessionStatusRow | undefined {
     return this.ctx.storage.sql.exec<SessionStatusRow>(
-      `SELECT session_id, snapshot IS NOT NULL AS has_snapshot, completed_turns, last_active
+      `SELECT session_id, completed_turns > 0 AS has_snapshot, completed_turns, last_active
        FROM session_state WHERE singleton = 1`,
     ).toArray()[0];
   }
 
-  #terminal(id: string): string | undefined {
-    const row = this.ctx.storage.sql.exec<TerminalRow>(
-      "SELECT payload FROM terminal_turns WHERE id = ?",
-      id,
-    ).toArray()[0];
-    return row?.payload;
+  #durabilityStore(): DurabilityStore {
+    const query = this.#durabilityQuery();
+    return createSqliteDurabilityStore({
+      transaction: (callback) => this.ctx.storage.transactionSync(() => callback(query)),
+    });
+  }
+
+  #durabilityQuery(): DurabilitySqliteQuery {
+    return <Row extends DurabilitySqliteRow>(sql: string, args: readonly DurabilitySqliteValue[]) => (
+      this.ctx.storage.sql.exec<Row>(sql, ...args).toArray()
+    );
   }
 
   #activeTurnIds(): string[] {
@@ -677,6 +690,20 @@ export class NanocodexSession extends DurableObject<Env> {
     if (socket.readyState !== WebSocket.OPEN) return;
     try { socket.send(encoded); } catch { closeSocket(socket, 1011, "send failed"); }
   }
+}
+
+function cloudflareWebTools(env: Env) {
+  if (!env.WEB_TOOL_URL) return [];
+  const url = new URL(env.WEB_TOOL_URL);
+  if (url.protocol !== "https:" && url.hostname !== "127.0.0.1" && url.hostname !== "localhost") {
+    throw new Error("WEB_TOOL_URL must use HTTPS outside local development");
+  }
+  return [web({
+    url,
+    headers: env.WEB_TOOL_TOKEN
+      ? { authorization: `Bearer ${env.WEB_TOOL_TOKEN}` }
+      : undefined,
+  })];
 }
 
 async function openAiWebSocket(
@@ -717,7 +744,7 @@ async function openSubscriptionWebSocket(
 async function subscriptionSnapshot(
   auth: DurableObjectStub<NanocodexSubscriptionAuth>,
   path: "/snapshot" | "/recover",
-  revision?: number,
+  revision?: string,
 ): Promise<SubscriptionSnapshot> {
   const response = await auth.fetch(`https://auth.internal${path}`, {
     method: "POST",

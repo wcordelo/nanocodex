@@ -25,7 +25,7 @@ pub(super) struct PromptCacheConfig {
 #[derive(Clone, Default)]
 pub(super) struct CodexCompatibility {
     pub(super) context: ContextSourceConfig,
-    pub(super) durability: DurabilityConfig,
+    pub(super) execution: ExecutionConfig,
 }
 
 impl<F> NanocodexBuilder<F> {
@@ -90,8 +90,6 @@ impl<F> NanocodexBuilder<F> {
     /// runtime is being built. Use this for agent-relative tools such as Code
     /// Mode child-agent tools; stateless tools may continue using
     /// [`Self::tools`].
-    #[cfg(not(target_family = "wasm"))]
-    #[cfg_attr(docsrs, doc(cfg(not(target_family = "wasm"))))]
     #[must_use]
     pub fn tools_factory<T>(mut self, factory: T) -> Self
     where
@@ -176,7 +174,7 @@ impl<F> NanocodexBuilder<F> {
                 .context
                 .set_codex_home(rollout.codex_home().to_path_buf());
         }
-        self.codex.durability.set_rollout(rollout);
+        self.codex.execution.set_rollout(rollout);
         self
     }
 
@@ -190,6 +188,25 @@ impl<F> NanocodexBuilder<F> {
     #[must_use]
     pub fn resume(mut self, snapshot: SessionSnapshot) -> Self {
         self.resume = Some(snapshot);
+        self
+    }
+
+    /// Returns the explicitly configured resume boundary, if any.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn resume_snapshot(&self) -> Option<&SessionSnapshot> {
+        self.resume.as_ref()
+    }
+
+    /// Attaches a higher-layer execution policy at the agent's model, tool,
+    /// and committed-session boundaries.
+    ///
+    /// Persistence formats, storage, admission, and recovery remain owned by
+    /// the implementing crate. Most callers use a higher-level extension such
+    /// as `nanocodex-durability` instead of invoking this seam directly.
+    #[must_use]
+    pub fn execution_policy(mut self, policy: Arc<dyn execution::ExecutionPolicy>) -> Self {
+        self.codex.execution.set_policy(policy);
         self
     }
 }

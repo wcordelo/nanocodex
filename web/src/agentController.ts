@@ -26,12 +26,15 @@ export type AgentControllerPayment = {
   accessKeyAddress(): string | undefined;
   channelId?: string;
   cumulative(): string;
+  mcpCumulative?(): string;
 };
 
 export type AgentControllerStart = {
   thinking: Thinking;
   reasoningMode: ReasoningMode;
+  threadId?: string;
   transport: "openai" | "chatgpt" | "mpp";
+  accessKeyAddress?: Address;
   payerAddress?: Address;
 };
 
@@ -106,9 +109,81 @@ export function createAgentController({
         await start({
           thinking: message.thinking,
           reasoningMode: message.reasoningMode,
+          ...(message.threadId ? { threadId: message.threadId } : {}),
           transport: message.transport,
+          ...(message.transport === "mpp"
+            ? { accessKeyAddress: message.accessKeyAddress }
+            : {}),
           payerAddress: message.transport === "mpp" ? message.payerAddress : undefined,
         });
+        return;
+      case "artifactPrompt": {
+        const target = { pane: "main" as const, branchId: 0 };
+        postMessage({
+          type: "externalPrompt",
+          target,
+          id: message.id,
+          prompt: message.prompt,
+        });
+        await handle({
+          type: "prompt",
+          target,
+          id: message.id,
+          prompt: message.prompt,
+          intent: "queue",
+        });
+        return;
+      }
+      case "voiceLifecycle": {
+        const branch = resolveTarget(message.target);
+        if (!branch) {
+          postVoiceLifecycleResult(message.id, message.action, undefined, "Branch is unavailable");
+          return;
+        }
+        try {
+          const context = await (message.action === "start"
+            ? branch.agent.session.realtime.start()
+            : branch.agent.session.realtime.end());
+          postVoiceLifecycleResult(message.id, message.action, context);
+        } catch (error) {
+          postVoiceLifecycleResult(message.id, message.action, undefined, errorMessage(error));
+        }
+        return;
+      }
+      case "voicePrompt": {
+        const branch = resolveTarget(message.target);
+        if (!branch) {
+          post("turnFinished", message.target, {
+            id: message.id,
+            error: "Branch is unavailable",
+          });
+          return;
+        }
+        const prompt = message.delegation.kind === "request"
+          ? branch.agent.session.realtime.delegation(
+              message.delegation.input,
+              message.delegation.transcript,
+            )
+          : branch.agent.session.realtime.tailDelegation(message.delegation.transcript);
+        if (!prompt) return;
+        postMessage({
+          type: "externalPrompt",
+          target: message.target,
+          id: message.id,
+          prompt,
+          intent: "immediate",
+        });
+        await handle({
+          type: "prompt",
+          target: message.target,
+          id: message.id,
+          prompt,
+          intent: "immediate",
+        });
+        return;
+      }
+      case "voiceTranscript":
+        postMessage(message);
         return;
       case "prompt": {
         const branch = resolveTarget(message.target);
@@ -219,7 +294,7 @@ export function createAgentController({
         return;
       }
       case "closeBtw": {
-        if (btw?.id === message.id) {
+        if (btw && btw.id === message.id) {
           const closing = btw;
           btw = undefined;
           await disposeBranch(closing);
@@ -383,11 +458,29 @@ export function createAgentController({
       accessKeyAddress: payment.accessKeyAddress(),
       channelId: payment.channelId,
       cumulative: payment.cumulative(),
+      ...(payment.mcpCumulative
+        ? { mcpCumulative: payment.mcpCumulative() }
+        : {}),
     };
     const encoded = JSON.stringify(status);
     if (encoded === lastPaymentStatus) return;
     lastPaymentStatus = encoded;
     postMessage({ type: "mppPayment", payment: status });
+  }
+
+  function postVoiceLifecycleResult(
+    id: number,
+    action: "start" | "stop",
+    context?: import("nanocodex-tui").VoiceSessionContext,
+    error?: string,
+  ): void {
+    postMessage({
+      type: "voiceLifecycleResult",
+      id,
+      action,
+      ...(context ? { context } : {}),
+      ...(error ? { error } : {}),
+    });
   }
 
   function rememberSessionImage(sessionId: string, imageUrl: string): void {

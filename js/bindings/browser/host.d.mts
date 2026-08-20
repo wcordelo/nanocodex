@@ -1,9 +1,17 @@
+import type {
+  CodeEvaluator,
+  DurabilityStore,
+  McpServers,
+  MppSession,
+  ToolMap,
+} from "../types.mjs";
+import type { Workspace } from "./workspace.mjs";
 export type BrowserTool = {
   description: string;
   parameters: Record<string, unknown>;
   handler: (
     input: unknown,
-    context: { sessionId: string },
+    context: { sessionId: string; signal: AbortSignal },
   ) => unknown | Promise<unknown>;
 };
 
@@ -44,8 +52,16 @@ export function createBrowserHost(options?: {
     sessionId: string,
     request: BrowserWebSocketRequest,
   ) => WebSocket | BrowserWebSocketConnection | Promise<WebSocket | BrowserWebSocketConnection>;
+  filesystem?: Workspace;
+  filesystemTools?: boolean;
   onEvent?: (eventJson: string) => void;
-  tools?: BrowserToolMap;
+  tools?: ToolMap;
+  mpp?: MppSession;
+  /** Remote MCP servers exposed through native and Code Mode tool_search plus deferred tools. */
+  mcp?: McpServers;
+  codeEvaluator?: CodeEvaluator;
+  toolMode?: "code" | "direct";
+  durability?: DurabilityStore;
   maxQueuedMessages?: number;
   maxQueuedBytes?: number;
   maxBufferedSendBytes?: number;

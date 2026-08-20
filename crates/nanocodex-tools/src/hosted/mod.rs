@@ -53,7 +53,9 @@ use std::{error::Error, fmt, future::Future, pin::Pin};
 use crate::{ToolContext, ToolDefinition, ToolInput, ToolOutput};
 
 pub use input::{prepare_output_images, prepare_user_input};
-pub use runtime::{HostedToolRuntime, HostedToolRuntimeControl, HostedTools};
+pub use runtime::{
+    HostedToolRuntime, HostedToolRuntimeControl, HostedTools, HostedToolsBuildError,
+};
 pub use types::{
     CodeModeExecution, CodeModeNotification, CodeModeObserver, CodeModeUpdate, NestedToolCall,
     OwnedToolContext,
@@ -151,5 +153,10 @@ pub trait CodeModeHost: Send + Sync + 'static {
                 "direct hosted tool `{name}` is unavailable"
             )))
         })
+    }
+
+    /// Cancels host-owned Code Mode and nested-tool work for one agent session.
+    fn cancel<'a>(&'a self, _session_id: &'a str) -> HostFuture<'a, Result<(), CodeModeHostError>> {
+        Box::pin(async { Ok(()) })
     }
 }

@@ -18,6 +18,7 @@ import { Streamdown, type Components } from "streamdown";
 
 import {
   appendError,
+  appendVoiceTranscript,
   applyAgentEvents,
   groupAgentEventsByTarget,
   initialTerminalState,
@@ -37,11 +38,19 @@ import {
   type TuiCommand,
   type TuiMessage,
   type TuiTarget,
+  type VoiceSessionContext,
 } from "nanocodex-tui";
+import type { Workspace } from "nanocodex/browser/workspace";
 import {
   useNanocodex,
   useNanocodexMessage,
 } from "nanocodex-react";
+import {
+  BrowserVoiceSession,
+  CHATGPT_VOICES,
+  parseVoiceArgument,
+  type ChatGptVoice,
+} from "./browserVoice.js";
 import { SyntaxCode } from "./SyntaxCode.js";
 
 type Target = TuiTarget;
@@ -50,12 +59,13 @@ type Focus = "main" | "btw";
 type BranchView = {
   id: number;
   parentId?: number;
+  sessionId?: string;
   conversation: TerminalState;
   draft: string;
   images: AttachedImage[];
 };
 
-type BtwView = { id: number; conversation: TerminalState };
+type BtwView = { id: number; sessionId?: string; conversation: TerminalState };
 
 type AttachedImage = { placeholder: string; dataUrl: string };
 
@@ -78,6 +88,24 @@ type TuiState = {
 };
 
 type TranscriptController = { scrollBy(rows: number): void; jumpToBottom(): void };
+type VoiceLifecycleRequest = {
+  action: "start" | "stop";
+  resolve(context: VoiceSessionContext | undefined): void;
+  reject(error: Error): void;
+};
+
+export type NanocodexVoiceOptions = {
+  /** Opens the workspace used to build bounded Realtime startup context. */
+  workspace(): Promise<Workspace>;
+  /** Acquires browser audio. Defaults to microphone capture; injectable for hosts and automation. */
+  captureMicrophone?(): Promise<MediaStream>;
+  /** Default ChatGPT output voice. */
+  defaultVoice?: ChatGptVoice;
+  /** Authenticated endpoint that creates one browser Realtime call. */
+  callUrl?: string | URL;
+  /** Optional authenticated sideband URL builder. */
+  sidebandUrl?(callId: string, sessionId: string): string | URL;
+};
 
 const DEFAULT_STARTER_PROMPT =
   "Explain in two sentences what runs in Rust/WASM and what the browser hosts.";
@@ -128,6 +156,8 @@ export type NanocodexTuiProps = Omit<
   enabled?: boolean;
   /** Status shown when the embedding application disables agent input. */
   unavailableMessage?: string;
+  /** Enables the component-owned browser Realtime voice lifecycle. */
+  voice?: NanocodexVoiceOptions;
 };
 
 export function NanocodexTui({
@@ -136,6 +166,7 @@ export function NanocodexTui({
   cwd = "/browser",
   enabled = true,
   unavailableMessage = "Agent unavailable",
+  voice: voiceOptions,
   className,
   "aria-label": ariaLabel = "Nanocodex terminal",
   onClick,
@@ -153,6 +184,8 @@ export function NanocodexTui({
   const [draft, setDraft] = useState(starterPrompt);
   const [images, setImages] = useState<AttachedImage[]>([]);
   const [externalEditor, setExternalEditor] = useState(false);
+  const [voiceActive, setVoiceActive] = useState(false);
+  const [voiceStatus, setVoiceStatus] = useState<string>();
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const terminalRef = useRef<HTMLElement>(null);
   const nextPromptId = useRef(1);
@@ -162,6 +195,12 @@ export function NanocodexTui({
   const eventQueue = useRef<Array<{ target: Target; event: AgentEvent }>>([]);
   const animationFrame = useRef<number | undefined>(undefined);
   const transcriptControllers = useRef(new Map<string, TranscriptController>());
+  const voiceSession = useRef<BrowserVoiceSession | undefined>(undefined);
+  const voiceStarting = useRef(false);
+  const voiceGeneration = useRef(0);
+  const voiceLifecycleRequests = useRef(new Map<number, VoiceLifecycleRequest>());
+  const nextVoiceLifecycleId = useRef(1);
+  const nextVoicePromptId = useRef(1);
 
   const flushEvents = useCallback(() => {
     if (animationFrame.current !== undefined) {
@@ -183,16 +222,62 @@ export function NanocodexTui({
   }, []);
 
   useNanocodexMessage<TuiMessage>((data) => {
+      voiceSession.current?.observe(data);
+      if (data.type === "ready") {
+        const active = voiceSession.current;
+        voiceSession.current = undefined;
+        voiceStarting.current = false;
+        voiceGeneration.current += 1;
+        setVoiceActive(false);
+        setVoiceStatus(undefined);
+        active?.abort();
+        setDraft(starterPrompt);
+        setImages([]);
+        setTui({
+          branches: [{
+            id: 0,
+            sessionId: data.sessionId,
+            conversation: initialTerminalState(),
+            draft: starterPrompt,
+            images: [],
+          }],
+          activeBranchId: 0,
+          focus: "main",
+        });
+        return;
+      }
+      if (data.type === "voiceLifecycleResult") {
+        const request = voiceLifecycleRequests.current.get(data.id);
+        if (request?.action === data.action) {
+          voiceLifecycleRequests.current.delete(data.id);
+          if (data.error) request.reject(new Error(data.error));
+          else request.resolve(data.context);
+        }
+        return;
+      }
       if (data.type === "event") {
         eventQueue.current.push({ target: data.target, event: data.event });
         animationFrame.current ??= requestAnimationFrame(flushEvents);
         return;
       }
       flushEvents();
-      if (data.type === "ready") return;
+      if (data.type === "externalPrompt") {
+        setTui((current) => updateConversation(current, data.target, (conversation) =>
+          data.intent === "immediate" && conversation.running
+            ? queueSteer(conversation, data.id, data.prompt)
+            : queuePrompt(conversation, data.id, data.prompt),
+        ));
+        return;
+      }
+      if (data.type === "voiceTranscript") {
+        setTui((current) => updateConversation(current, data.target, (conversation) =>
+          appendVoiceTranscript(conversation, data.speaker, data.text),
+        ));
+        return;
+      }
       if (data.type === "turnFinished") {
         setTui((current) => updateConversation(current, data.target, (conversation) =>
-          turnFinished(conversation, data.error),
+          turnFinished(conversation, data.error, data.message),
         ));
         return;
       }
@@ -232,6 +317,7 @@ export function NanocodexTui({
           ...current,
           btw: {
             ...current.btw,
+            sessionId: data.sessionId,
             conversation: {
               ...current.btw.conversation,
               status: current.btw.conversation.pendingTurns ? "Starting" : "Ready",
@@ -253,7 +339,15 @@ export function NanocodexTui({
         } : current);
         return;
       }
-      if (data.type === "branchOpened") return;
+      if (data.type === "branchOpened") {
+        setTui((current) => ({
+          ...current,
+          branches: current.branches.map((branch) => branch.id === data.id
+            ? { ...branch, sessionId: data.sessionId }
+            : branch),
+        }));
+        return;
+      }
       if (data.type === "branchOpenFailed") {
         setTui((current) => updateConversation(
           current,
@@ -271,7 +365,43 @@ export function NanocodexTui({
 
   useEffect(() => () => {
     if (animationFrame.current !== undefined) cancelAnimationFrame(animationFrame.current);
+    voiceSession.current?.abort();
+    voiceSession.current = undefined;
+    voiceStarting.current = false;
+    voiceGeneration.current += 1;
+    for (const request of voiceLifecycleRequests.current.values()) {
+      request.reject(new Error("voice lifecycle stopped with the agent worker"));
+    }
+    voiceLifecycleRequests.current.clear();
   }, []);
+
+  useEffect(() => {
+    if (workerStatus === "ready") return;
+    const active = voiceSession.current;
+    voiceSession.current = undefined;
+    voiceStarting.current = false;
+    voiceGeneration.current += 1;
+    setVoiceActive(false);
+    active?.abort();
+    for (const request of voiceLifecycleRequests.current.values()) {
+      request.reject(new Error("voice lifecycle stopped with the agent worker"));
+    }
+    voiceLifecycleRequests.current.clear();
+  }, [workerStatus]);
+
+  const runVoiceLifecycle = useCallback((
+    action: "start" | "stop",
+    target: TuiTarget,
+  ): Promise<VoiceSessionContext | undefined> => new Promise((resolve, reject) => {
+    const id = nextVoiceLifecycleId.current++;
+    voiceLifecycleRequests.current.set(id, { action, resolve, reject });
+    try {
+      dispatch({ type: "voiceLifecycle", id, target, action });
+    } catch (error) {
+      voiceLifecycleRequests.current.delete(id);
+      reject(error instanceof Error ? error : new Error(String(error)));
+    }
+  }), [dispatch]);
 
   useLayoutEffect(() => {
     const composer = composerRef.current;
@@ -284,6 +414,92 @@ export function NanocodexTui({
   const conversation = activeConversation(tui);
   const activeBranch = branchById(tui, tui.activeBranchId)!;
   const target = activeTarget(tui);
+  const controlVoice = useCallback((argument: string | undefined, voiceTarget: TuiTarget) => {
+    if (!voiceOptions) return;
+    if (voiceStarting.current) return;
+    voiceStarting.current = true;
+    const command = parseVoiceArgument(argument);
+    if (command.action === "list") {
+      voiceStarting.current = false;
+      setVoiceStatus(`ChatGPT voices (default ${voiceOptions.defaultVoice ?? "cove"}): ${CHATGPT_VOICES.join(", ")}`);
+      return;
+    }
+    if (command.action === "invalid") {
+      voiceStarting.current = false;
+      setVoiceStatus(`Voice: ${command.message}`);
+      return;
+    }
+    if (command.action === "stop" || (command.action === "toggle" && voiceSession.current)) {
+      voiceStarting.current = false;
+      const active = voiceSession.current;
+      voiceSession.current = undefined;
+      setVoiceActive(false);
+      void active?.close().catch((error) => {
+        setVoiceStatus(`Voice: ${error instanceof Error ? error.message : String(error)}`);
+      });
+      return;
+    }
+    if (voiceSession.current) {
+      voiceStarting.current = false;
+      setVoiceStatus("Voice is already active; use /voice off before changing it");
+      return;
+    }
+    const sessionId = sessionIdForTarget(tui, voiceTarget);
+    if (!sessionId || workerStatus !== "ready") {
+      voiceStarting.current = false;
+      setVoiceStatus("Voice is waiting for this branch session to become ready");
+      return;
+    }
+    const selectedVoice = command.action === "start"
+      ? command.voice
+      : voiceOptions.defaultVoice ?? "cove";
+    const next = new BrowserVoiceSession({
+      sessionId,
+      target: voiceTarget,
+      voice: selectedVoice,
+      callUrl: voiceOptions.callUrl,
+      sidebandUrl: voiceOptions.sidebandUrl,
+      captureMicrophone: voiceOptions.captureMicrophone,
+      workspace: voiceOptions.workspace,
+      async onStart() {
+        const context = await runVoiceLifecycle("start", voiceTarget);
+        if (!context) throw new Error("voice lifecycle start omitted the agent context");
+        return context;
+      },
+      async onStop() {
+        await runVoiceLifecycle("stop", voiceTarget);
+      },
+      onDelegation(delegation) {
+        dispatch({
+          type: "voicePrompt",
+          target: voiceTarget,
+          id: nextVoicePromptId.current++,
+          delegation,
+        });
+      },
+      onStatus: setVoiceStatus,
+      onTerminated(status) {
+        if (voiceSession.current !== next) return;
+        voiceSession.current = undefined;
+        voiceStarting.current = false;
+        setVoiceActive(false);
+        setVoiceStatus(status);
+      },
+      onTranscript(speaker, text) {
+        dispatch({ type: "voiceTranscript", target: voiceTarget, speaker, text });
+      },
+    });
+    voiceSession.current = next;
+    voiceStarting.current = false;
+    setVoiceActive(true);
+    void next.start().catch(async (error) => {
+      if (voiceSession.current !== next) return;
+      await next.close().catch(() => {});
+      voiceSession.current = undefined;
+      setVoiceActive(false);
+      setVoiceStatus(`Voice: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }, [dispatch, runVoiceLifecycle, tui, voiceOptions, workerStatus]);
   const mode = tui.historicalEdit
     ? "edit"
     : tui.branchNavigatorId !== undefined
@@ -350,8 +566,29 @@ export function NanocodexTui({
           },
         } : current);
       } else {
-        dispatch({ type: "closeBtw", id: tui.btw.id });
-        setTui((current) => ({ ...current, btw: undefined, focus: "main" }));
+        const closingId = tui.btw.id;
+        const closeBranch = () => {
+          dispatch({ type: "closeBtw", id: closingId });
+          setTui((current) => current.btw?.id === closingId
+            ? { ...current, btw: undefined, focus: "main" }
+            : current);
+        };
+        const activeVoice = voiceSession.current;
+        if (activeVoice && sameTarget(activeVoice.target, { pane: "btw", id: closingId })) {
+          voiceSession.current = undefined;
+          voiceStarting.current = true;
+          setVoiceActive(false);
+          void activeVoice.close()
+            .catch((error) => {
+              setVoiceStatus(`Voice: ${error instanceof Error ? error.message : String(error)}`);
+            })
+            .finally(() => {
+              voiceStarting.current = false;
+              closeBranch();
+            });
+        } else {
+          closeBranch();
+        }
       }
       return;
     }
@@ -361,6 +598,11 @@ export function NanocodexTui({
     }
     if (trimmed === "/trace") {
       window.open("http://127.0.0.1:16686/search?service=nanocodex", "_blank", "noopener");
+      return;
+    }
+    if (voiceOptions && (trimmed === "/voice" || trimmed.startsWith("/voice "))) {
+      const argument = trimmed === "/voice" ? undefined : trimmed.slice(7).trim() || undefined;
+      controlVoice(argument, target);
       return;
     }
     queueInput(target, raw, intent, submittedImages);
@@ -712,7 +954,9 @@ export function NanocodexTui({
       }}
       onClick={(event) => {
         onClick?.(event);
-        if (!event.defaultPrevented) composerRef.current?.focus();
+        if (!event.defaultPrevented && !window.matchMedia("(pointer: coarse)").matches) {
+          composerRef.current?.focus();
+        }
       }}
     >
       <header className="agent-tui-header" data-nc-part="header">
@@ -787,16 +1031,55 @@ export function NanocodexTui({
         {mode === "branches" || mode === "edit" ? (
           <span className="tui-draft-preserved"> draft preserved </span>
         ) : (
-          <textarea
-            ref={composerRef}
-            value={draft}
-            disabled={!ready || stopped || !enabled}
-            aria-label="Message Nanocodex"
-            onChange={(event) => updateDraft(event.target.value)}
-            onPaste={handleImagePaste}
-            rows={1}
-            spellCheck={false}
-          />
+          <>
+            <textarea
+              ref={composerRef}
+              value={draft}
+              disabled={!ready || stopped || !enabled}
+              aria-label="Message Nanocodex"
+              onChange={(event) => updateDraft(event.target.value)}
+              onPaste={handleImagePaste}
+              rows={1}
+              spellCheck={false}
+            />
+            <div className="agent-tui-mobile-actions">
+              {voiceOptions ? (
+                <button
+                  type="button"
+                  className="agent-tui-voice"
+                  disabled={!ready || stopped || !enabled}
+                  aria-label={voiceActive ? "Stop voice mode" : "Start voice mode"}
+                  aria-pressed={voiceActive}
+                  title={voiceActive ? "Stop voice mode (/voice off)" : "Start voice mode (/voice)"}
+                  onClick={() => controlVoice(undefined, target)}
+                >🎙 {voiceActive ? "Stop" : "Voice"}</button>
+              ) : null}
+              <button
+                type="button"
+                className="agent-tui-mobile-only"
+                disabled={!ready || stopped || !enabled}
+                aria-label="Insert a new line"
+                onClick={() => {
+                  updateDraft(`${draft}\n`);
+                  composerRef.current?.focus();
+                }}
+              >↵</button>
+              {conversation.running ? (
+                <button
+                  type="button"
+                  className="agent-tui-mobile-only"
+                  disabled={!ready || stopped || !enabled}
+                  onClick={cancelTurn}
+                >Stop</button>
+              ) : null}
+              <button
+                type="button"
+                className="agent-tui-mobile-only"
+                disabled={(!draft.trim() && !images.length) || !ready || stopped || !enabled}
+                onClick={() => submit("immediate")}
+              >{conversation.running ? "Steer" : "Send"}</button>
+            </div>
+          </>
         )}
       </fieldset>
 
@@ -808,6 +1091,7 @@ export function NanocodexTui({
         workerError={workerError}
         enabled={enabled}
         unavailableMessage={unavailableMessage}
+        voiceStatus={voiceStatus}
       />
 
       {externalEditor ? (
@@ -1087,7 +1371,7 @@ function PendingPane({ title, conversation, focused }: { title: string; conversa
   </fieldset>;
 }
 
-const Footer = memo(function Footer({ tui, conversation, mode, workerStatus, workerError, enabled, unavailableMessage }: {
+const Footer = memo(function Footer({ tui, conversation, mode, workerStatus, workerError, enabled, unavailableMessage, voiceStatus }: {
   tui: TuiState;
   conversation: TerminalState;
   mode: "normal" | "history" | "edit" | "branches";
@@ -1095,6 +1379,7 @@ const Footer = memo(function Footer({ tui, conversation, mode, workerStatus, wor
   workerError?: string;
   enabled: boolean;
   unavailableMessage: string;
+  voiceStatus?: string;
 }) {
   const spinning = mode === "normal" && conversation.running && !conversation.status.startsWith("Stop Agent");
   const [frame, setFrame] = useState(0);
@@ -1108,7 +1393,7 @@ const Footer = memo(function Footer({ tui, conversation, mode, workerStatus, wor
     : workerStatus === "error"
       ? workerError ?? "Agent worker failed"
       : workerStatus === "starting"
-        ? "Loading Rust/WASM..."
+        ? conversation.status
         : workerStatus === "idle" || !enabled
           ? unavailableMessage
           : conversation.status;
@@ -1116,12 +1401,13 @@ const Footer = memo(function Footer({ tui, conversation, mode, workerStatus, wor
   else if (mode === "edit") status = "Editing history — Enter fork/send · Shift+Enter newline · Esc cancel · Ctrl+G $EDITOR";
   else if (mode === "history") status = "History — ↑/↓ navigate · e fork-edit · Esc return";
   else if (spinning) status = `${SPINNER[frame % SPINNER.length]} Thinking...`;
+  else if (voiceStatus) status = voiceStatus;
   const queued = Math.max(0, conversation.pendingTurns - Number(conversation.running));
   const steers = conversation.pendingSteers.length;
   const counts = [steers ? `${steers} steer${steers === 1 ? "" : "s"}` : "", queued ? `${queued} queued` : ""].filter(Boolean).join(" · ");
   const help = tui.btw
     ? "BackTab switch · Ctrl+V image · /close dismiss · Enter send/steer · Tab queue · Esc Esc stop · Ctrl+C quit"
-    : "/btw <question> side fork · Ctrl+V image · Enter send/steer · Tab queue · Esc Esc stop · Ctrl+C quit";
+    : "/btw <question> side fork · /voice [voice] · Ctrl+V image · Enter send/steer · Tab queue · Esc Esc stop · Ctrl+C quit";
   return <footer className="agent-tui-footer" data-nc-part="footer"> {status}{counts ? ` · ${counts}` : ""}  {help}</footer>;
 });
 
@@ -1171,6 +1457,19 @@ function conversationForTarget(tui: TuiState, target: Target): TerminalState | u
 
 function branchById(tui: TuiState, id: number): BranchView | undefined {
   return tui.branches.find((branch) => branch.id === id);
+}
+
+function sessionIdForTarget(tui: TuiState, target: TuiTarget): string | undefined {
+  return target.pane === "main"
+    ? branchById(tui, target.branchId)?.sessionId
+    : tui.btw?.id === target.id ? tui.btw.sessionId : undefined;
+}
+
+function sameTarget(left: TuiTarget, right: TuiTarget): boolean {
+  return left.pane === right.pane
+    && (left.pane === "main"
+      ? right.pane === "main" && left.branchId === right.branchId
+      : right.pane === "btw" && left.id === right.id);
 }
 
 function persistActiveDraft(tui: TuiState, draft: string, images: AttachedImage[]): BranchView[] {
